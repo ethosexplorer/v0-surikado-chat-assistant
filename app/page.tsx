@@ -80,26 +80,9 @@ export default function SurikadoChat() {
     setInputMessage("")
     setIsLoading(true)
 
+    const needsSoftSkillsWait = shouldDelayForSoftSkills(messages)
+
     try {
-      // wait 1–2 minutes before calling the API.
-      if (shouldDelayForSoftSkills(messages)) {
-        const delay = randomDelayMs(SOFT_SKILLS_DELAY_MIN_MS, SOFT_SKILLS_DELAY_MAX_MS)
-
-        // optional informational note so users understand the wait
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}-wait`,
-            type: "system",
-            content:
-              "Thanks for sharing your soft skills. Gathering additional insights… this can take up to 1–2 minutes.",
-            timestamp: new Date(),
-          },
-        ])
-
-        await new Promise((resolve) => setTimeout(resolve, delay))
-      }
-
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -114,7 +97,7 @@ export default function SurikadoChat() {
         try {
           result = JSON.parse(text)
         } catch {
-          // Non-JSON upstream; show raw text
+          // Non-JSON: show text
           result = { ok: response.ok, message: text }
         }
       } catch {
@@ -124,6 +107,10 @@ export default function SurikadoChat() {
       displayMessage =
         (result && typeof result.message === "string" && result.message) ||
         (typeof result === "string" ? result : JSON.stringify(result))
+
+      if (needsSoftSkillsWait) {
+        await new Promise((resolve) => setTimeout(resolve, 120_000))
+      }
 
       const systemMessage: Message = {
         id: (Date.now() + 1).toString(),

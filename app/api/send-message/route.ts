@@ -9,6 +9,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Message is required" }, { status: 400 })
     }
 
+    const timeoutMs = 60_000
+
     const normalizeWhatsApp = (raw: unknown) => {
       if (!raw) return ""
       let n = String(raw).trim()
@@ -62,7 +64,7 @@ export async function POST(request: NextRequest) {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(webhookPayload),
-            signal: AbortSignal.timeout(60_000),
+            signal: AbortSignal.timeout(timeoutMs),
           })
 
           const contentType = response.headers.get("content-type") || ""
@@ -80,7 +82,6 @@ export async function POST(request: NextRequest) {
           const body = await getBody()
 
           if (response.ok) {
-            // Unwrap common shapes; return a stable JSON response for the client to render.
             const message =
               (body && typeof body === "object" && "output" in body && body.output) ||
               (body && typeof body === "object" && "message" in body && body.message) ||
