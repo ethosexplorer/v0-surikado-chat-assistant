@@ -20,9 +20,53 @@ export default function SurikadoChat() {
   const [isParsing, setIsParsing] = useState(false)
   const [showParsedJSON, setShowParsedJSON] = useState(false)
   const [parsedResume, setParsedResume] = useState<any>(null)
+  const [toPhone, setToPhone] = useState("")
+
+  const SOFT_SKILLS_DELAY_MIN_MS = 60_000
+  const SOFT_SKILLS_DELAY_MAX_MS = 120_000
+
+  const randomDelayMs = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min
+
+  /** Returns true when the last non-user message asked about soft skills */
+  const shouldDelayForSoftSkills = (msgs: Message[]) => {
+    // find the last assistant/system message
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      if (m.type !== "user") {
+        const t = (m.content || "").toLowerCase()
+        // prompt variants we commonly see
+        if (/soft\s*skills?/.test(t) || /your\s+soft\s+skills?/.test(t) || /list.*soft\s*skills?/.test(t)) {
+          return true
+        }
+        // stop scanning after the last assistant/system message
+        return false
+      }
+    }
+    return false
+  }
+
+  const normalizeWhatsApp = (raw: string) => {
+    if (!raw) return ""
+    let n = String(raw).trim()
+    if (n.toLowerCase().startsWith("whatsapp:")) n = n.slice(9)
+    n = n.replace(/[^+\d]/g, "")
+    if (!n.startsWith("+")) n = `+${n}`
+    return `whatsapp:${n}`
+  }
 
   const handleSendMessage = async () => {
     if (!inputMessage.trim()) return
+
+    if (!toPhone.trim()) {
+      const warn: Message = {
+        id: `${Date.now()}`,
+        type: "system",
+        content: "Please enter your WhatsApp number (e.g., +123456789) before sending.",
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, warn])
+      return
+    }
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -37,39 +81,65 @@ export default function SurikadoChat() {
     setIsLoading(true)
 
     try {
+      // wait 1–2 minutes before calling the API.
+      if (shouldDelayForSoftSkills(messages)) {
+        const delay = randomDelayMs(SOFT_SKILLS_DELAY_MIN_MS, SOFT_SKILLS_DELAY_MAX_MS)
+
+        // optional informational note so users understand the wait
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}-wait`,
+            type: "system",
+            content:
+              "Thanks for sharing your soft skills. Gathering additional insights… this can take up to 1–2 minutes.",
+            timestamp: new Date(),
+          },
+        ])
+
+        await new Promise((resolve) => setTimeout(resolve, delay))
+      }
+
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: messageToSend }),
+        body: JSON.stringify({ message: messageToSend, toPhone: normalizeWhatsApp(toPhone) }),
       })
 
-      const result = await response.json()
+      let result: any = null
+      let displayMessage = "No response received."
 
-      if (result.success || result.fallback) {
-        const systemMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          type: "api",
-          content: result.message || result.response || "API response received successfully",
-          timestamp: new Date(),
+      try {
+        const text = await response.text()
+        try {
+          result = JSON.parse(text)
+        } catch {
+          // Non-JSON upstream; show raw text
+          result = { ok: response.ok, message: text }
         }
-        setMessages((prev) => [...prev, systemMessage])
-      } else if (response.ok) {
-        const systemMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          type: "api",
-          content: JSON.stringify(result, null, 2),
-          timestamp: new Date(),
-        }
-        setMessages((prev) => [...prev, systemMessage])
-      } else {
-        throw new Error(result.error || "API call failed")
+      } catch {
+        result = { ok: false, message: "Failed to read response" }
       }
+
+      displayMessage =
+        (result && typeof result.message === "string" && result.message) ||
+        (typeof result === "string" ? result : JSON.stringify(result))
+
+      const systemMessage: Message = {
+        id: (Date.now() + 1).toString(),
+        type: response.ok ? "api" : "system",
+        content: displayMessage,
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, systemMessage])
     } catch (error) {
       console.error("Error calling API:", error)
       const errorMessage: Message = {
         id: (Date.now() + 2).toString(),
         type: "system",
-        content: `Error: ${error instanceof Error ? error.message : "Failed to call API"}`,
+        content: `Network error while contacting webhook. Please try again. ${
+          error instanceof Error ? error.message : ""
+        }`,
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, errorMessage])
@@ -128,38 +198,41 @@ export default function SurikadoChat() {
 
   const handleClearCache = async () => {
     try {
-      const response = await fetch("https://surikado.hellodexter.com/webhook/delete-chat-history", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          specversion: "1.0",
-          type: "com.twilio.messaging.inbound-message.received",
-          source:
-            "/2010-04-01/Accounts/AC24c60aa1d6a19f352f19a63198bd4252/Messages/SM0784303f394b6086ce8fdcf707284eb9.json",
-          id: "EZ279e45baa01be63f2aff062dbad97817",
-          dataschema: "https://events-schemas.twilio.com/Messaging.InboundMessageV1/5",
-          datacontenttype: "application/json",
-          time: new Date().toISOString(),
-          data: {
-            numMedia: 0,
-            timestamp: new Date().toISOString(),
-            recipients: [],
-            accountSid: "AC24c60aa1d6a19f352f19a63198bd4252",
-            messagingServiceSid: "MG6bf385d0da89ad4660cc24875ebb1ec4",
-            to: "whatsapp:+447418633913",
-            numSegments: 1,
-            messageSid: "SM0784303f394b6086ce8fdcf707284eb9",
-            eventName: "com.twilio.messaging.inbound-message.received",
-            body: "Clear chat history",
-            database: "surikadodb",
-            collection: "n8n_chat_histories",
-            sessionId: "whatsapp:+923346250250",
-          },
-        }),
-      })
+      const sessionId = toPhone.trim() ? normalizeWhatsApp(toPhone) : ""
+      if (sessionId) {
+        const response = await fetch("https://surikado.hellodexter.com/webhook/delete-chat-history", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            specversion: "1.0",
+            type: "com.twilio.messaging.inbound-message.received",
+            source:
+              "/2010-04-01/Accounts/AC24c60aa1d6a19f352f19a63198bd4252/Messages/SM0784303f394b6086ce8fdcf707284eb9.json",
+            id: "EZ279e45baa01be63f2aff062dbad97817",
+            dataschema: "https://events-schemas.twilio.com/Messaging.InboundMessageV1/5",
+            datacontenttype: "application/json",
+            time: new Date().toISOString(),
+            data: {
+              numMedia: 0,
+              timestamp: new Date().toISOString(),
+              recipients: [],
+              accountSid: "AC24c60aa1d6a19f352f19a63198bd4252",
+              messagingServiceSid: "MG6bf385d0da89ad4660cc24875ebb1ec4",
+              to: "whatsapp:+447418633913",
+              numSegments: 1,
+              messageSid: "SM0784303f394b6086ce8fdcf707284eb9",
+              eventName: "com.twilio.messaging.inbound-message.received",
+              body: "Clear chat history",
+              database: "surikadodb",
+              collection: "n8n_chat_histories",
+              sessionId,
+            },
+          }),
+        })
 
-      if (!response.ok) {
-        console.error("Failed to delete chat history from server")
+        if (!response.ok) {
+          console.error("Failed to delete chat history from server")
+        }
       }
     } catch (error) {
       console.error("Error calling delete chat history API:", error)
@@ -182,7 +255,13 @@ export default function SurikadoChat() {
               <p className="text-blue-100 text-sm">Your AI-powered job opportunity assistant</p>
             </div>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-2 items-center">
+            <Input
+              value={toPhone}
+              onChange={(e) => setToPhone(e.target.value)}
+              placeholder="Your WhatsApp number e.g. +123456789"
+              className="w-60 bg-white/10 text-white placeholder:text-blue-100 border-white/20"
+            />
             <Button
               variant="secondary"
               size="sm"

@@ -9,7 +9,20 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Message is required" }, { status: 400 })
     }
 
-    console.log("[v0] Processing message:", userMessage)
+    const normalizeWhatsApp = (raw: unknown) => {
+      if (!raw) return ""
+      let n = String(raw).trim()
+      if (n.toLowerCase().startsWith("whatsapp:")) n = n.slice(9)
+      n = n.replace(/[^+\d]/g, "")
+      if (!n.startsWith("+")) n = `+${n}`
+      return `whatsapp:${n}`
+    }
+    const userPhone = normalizeWhatsApp(data.toPhone)
+    if (!userPhone) {
+      return NextResponse.json({ error: "toPhone (WhatsApp number) is required" }, { status: 400 })
+    }
+
+    console.log("[v0] Processing message:", userMessage, "from", userPhone)
 
     const webhookPayload = {
       specversion: "1.0",
@@ -30,73 +43,75 @@ export async function POST(request: NextRequest) {
         messageSid: `SM${data.timestamp || Date.now()}`,
         eventName: "com.twilio.messaging.inbound-message.received",
         body: userMessage,
-        from: "whatsapp:+923346250250",
+        from: userPhone,
       },
     }
 
-    const webhookUrl = "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144"
+    const endpoints = [
+      "https://surikado.hellodexter.com:5678/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
+      "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
+    ]
 
-    try {
-      const response = await fetch(webhookUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(webhookPayload),
-        signal: AbortSignal.timeout(30000),
-      })
+    const maxAttempts = 3
+    let lastDetail = "Unknown error"
 
-      if (response.status === 200) {
-        const contentType = response.headers.get("content-type")
-        let result
+    for (const url of endpoints) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+          const response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(webhookPayload),
+            signal: AbortSignal.timeout(60_000),
+          })
 
-        if (contentType && contentType.includes("application/json")) {
-          result = await response.json()
-          if (result.output !== undefined) {
-            return NextResponse.json({ message: result.output })
+          const contentType = response.headers.get("content-type") || ""
+          const getBody = async () => {
+            if (contentType.includes("application/json")) {
+              try {
+                return await response.json()
+              } catch {
+                return { raw: await response.text() }
+              }
+            }
+            return { raw: await response.text() }
           }
-          if (result.message !== undefined) {
-            return NextResponse.json({ message: result.message })
+
+          const body = await getBody()
+
+          if (response.ok) {
+            // Unwrap common shapes; return a stable JSON response for the client to render.
+            const message =
+              (body && typeof body === "object" && "output" in body && body.output) ||
+              (body && typeof body === "object" && "message" in body && body.message) ||
+              (typeof body === "string" ? body : JSON.stringify(body))
+            return NextResponse.json({ ok: true, message })
+          } else {
+            lastDetail = `Status ${response.status}: ${typeof body === "string" ? body : JSON.stringify(body)}`
+            console.log(`[v0] Webhook ${url} attempt ${attempt}/${maxAttempts} failed: ${lastDetail}`)
           }
-          // If no specific field, return the whole result as message
-          return NextResponse.json({ message: JSON.stringify(result) })
-        } else {
-          const textResponse = await response.text()
-          return NextResponse.json({ message: textResponse })
+        } catch (err) {
+          lastDetail = err instanceof Error ? err.message : String(err)
+          console.log(`[v0] Webhook ${url} attempt ${attempt}/${maxAttempts} network error:`, lastDetail)
         }
-      } else {
-        const contentType = response.headers.get("content-type")
-        let errorMessage
 
-        if (contentType && contentType.includes("application/json")) {
-          try {
-            const errorData = await response.json()
-            errorMessage = errorData.message || errorData.error || "Unknown error"
-          } catch {
-            errorMessage = await response.text()
-          }
-        } else {
-          errorMessage = await response.text()
+        if (attempt < maxAttempts) {
+          const backoff = 500 * 2 ** (attempt - 1)
+          await new Promise((r) => setTimeout(r, backoff))
         }
-
-        console.log("[v0] Webhook failed with status:", response.status, "Error:", errorMessage)
-        return NextResponse.json({
-          error: "Webhook request failed",
-          status: response.status,
-          message: errorMessage,
-        })
       }
-    } catch (networkError) {
-      console.log("[v0] Network error:", networkError instanceof Error ? networkError.message : "Unknown error")
-
-      return NextResponse.json({
-        message: `Echo: ${userMessage}`,
-      })
     }
+
+    // If we reach here, all attempts to all endpoints failed. Return a friendly message with 200.
+    return NextResponse.json({
+      ok: false,
+      message: `Upstream webhook unreachable: ${lastDetail}. Please try again later.`,
+    })
   } catch (error) {
     console.error("[v0] Server error:", error instanceof Error ? error.message : "Unknown error")
-    return NextResponse.json({
-      error: `Server error: ${error instanceof Error ? error.message : "Unknown error"}`,
-    })
+    return NextResponse.json(
+      { error: `Server error: ${error instanceof Error ? error.message : "Unknown error"}` },
+      { status: 500 },
+    )
   }
 }
