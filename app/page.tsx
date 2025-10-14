@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
@@ -21,24 +21,30 @@ export default function SurikadoChat() {
   const [showParsedJSON, setShowParsedJSON] = useState(false)
   const [parsedResume, setParsedResume] = useState<any>(null)
   const [toPhone, setToPhone] = useState("")
+  
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const [isPolling, setIsPolling] = useState(false)
+  const [currentRequestId, setCurrentRequestId] = useState<string>("")
 
-  const SOFT_SKILLS_DELAY_MIN_MS = 60_000
-  const SOFT_SKILLS_DELAY_MAX_MS = 120_000
+  // DYNAMIC TIMEOUTS BASED ON MESSAGE TYPE
+  const SOFT_SKILLS_TIMEOUT_MS = 180_000 // 3 minutes for soft skills
+  const NORMAL_TIMEOUT_MS = 120_000 // 2 minutes for normal messages
+  const POLL_INTERVAL_MS = 3_000 // Poll every 3 seconds
 
-  const randomDelayMs = (min: number, max: number) => Math.floor(Math.random() * (max - min + 1)) + min
-
-  /** Returns true when the last non-user message asked about soft skills */
   const shouldDelayForSoftSkills = (msgs: Message[]) => {
-    // find the last assistant/system message
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]
       if (m.type !== "user") {
         const t = (m.content || "").toLowerCase()
-        // prompt variants we commonly see
-        if (/soft\s*skills?/.test(t) || /your\s+soft\s+skills?/.test(t) || /list.*soft\s*skills?/.test(t)) {
+        if (
+          /soft\s*skills?/.test(t) ||
+          /your\s+soft\s+skills?/.test(t) ||
+          /list.*soft\s*skills?/.test(t) ||
+          /what\s+soft\s+skills\s+do\s+you\s+excel\s+at/.test(t) ||
+          (/teamwork/.test(t) && /problem-?solving/.test(t))
+        ) {
           return true
         }
-        // stop scanning after the last assistant/system message
         return false
       }
     }
@@ -53,6 +59,113 @@ export default function SurikadoChat() {
     if (!n.startsWith("+")) n = `+${n}`
     return `whatsapp:${n}`
   }
+
+  const stopPolling = () => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current)
+      pollingIntervalRef.current = null
+    }
+    setIsPolling(false)
+    setIsLoading(false)
+    setCurrentRequestId("")
+  }
+
+  const pollForResponse = async (startTime: number, isSoftSkills: boolean) => {
+    try {
+      const response = await fetch("/api/send-message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ 
+          action: "poll",
+          toPhone: normalizeWhatsApp(toPhone) 
+        }),
+      })
+
+      const result = await response.json()
+
+      // DYNAMIC TIMEOUT BASED ON MESSAGE TYPE
+      const timeoutMs = isSoftSkills ? SOFT_SKILLS_TIMEOUT_MS : NORMAL_TIMEOUT_MS
+      
+      // Check if we've been polling too long
+      if (Date.now() - startTime > timeoutMs) {
+        stopPolling()
+        const timeoutMessage: Message = {
+          id: `${Date.now()}`,
+          type: "system",
+          content: `Response timeout after ${timeoutMs/1000} seconds. The request is taking longer than expected.`,
+          timestamp: new Date(),
+        }
+        setMessages((prev) => [...prev, timeoutMessage])
+        return
+      }
+
+      if (result.status === 'completed') {
+        stopPolling()
+        
+        // Add a small delay for better UX (optional)
+        await new Promise((resolve) => setTimeout(resolve, 500))
+        
+        const systemMessage: Message = {
+          id: `${Date.now()}`,
+          type: "api",
+          content: result.message || "Response received",
+          timestamp: new Date(),
+        }
+        setMessages((prev) => [...prev, systemMessage])
+      } else if (result.status === 'error') {
+        stopPolling()
+        const errorMessage: Message = {
+          id: `${Date.now()}`,
+          type: "system",
+          content: result.message || "An error occurred processing your request",
+          timestamp: new Date(),
+        }
+        setMessages((prev) => [...prev, errorMessage])
+      } else if (result.status === 'expired') {
+        stopPolling()
+        const expiredMessage: Message = {
+          id: `${Date.now()}`,
+          type: "system",
+          content: "Request expired. Please try your message again.",
+          timestamp: new Date(),
+        }
+        setMessages((prev) => [...prev, expiredMessage])
+      }
+      // If status is 'pending', continue polling
+    } catch (error) {
+      console.error("Error polling for response:", error)
+      stopPolling()
+      const errorMessage: Message = {
+        id: `${Date.now()}`,
+        type: "system",
+        content: "Error checking for response. Please try again.",
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, errorMessage])
+    }
+  }
+
+  const startPolling = (isSoftSkills: boolean) => {
+    const startTime = Date.now()
+    setIsPolling(true)
+
+    // Poll immediately
+    pollForResponse(startTime, isSoftSkills)
+
+    // Then poll every POLL_INTERVAL_MS
+    pollingIntervalRef.current = setInterval(() => {
+      pollForResponse(startTime, isSoftSkills)
+    }, POLL_INTERVAL_MS)
+  }
+
+  // Cleanup polling on unmount
+  useEffect(() => {
+    return () => {
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current)
+      }
+    }
+  }, [])
 
   const handleSendMessage = async () => {
     if (!inputMessage.trim()) return
@@ -80,58 +193,59 @@ export default function SurikadoChat() {
     setInputMessage("")
     setIsLoading(true)
 
-    const needsSoftSkillsWait = shouldDelayForSoftSkills(messages)
+    const shouldDelay = shouldDelayForSoftSkills(messages)
 
     try {
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: messageToSend, toPhone: normalizeWhatsApp(toPhone) }),
+        body: JSON.stringify({ 
+          action: "send",
+          message: messageToSend, 
+          toPhone: normalizeWhatsApp(toPhone) 
+        }),
       })
 
-      let result: any = null
-      let displayMessage = "No response received."
+      const result = await response.json()
 
-      try {
-        const text = await response.text()
-        try {
-          result = JSON.parse(text)
-        } catch {
-          // Non-JSON: show text
-          result = { ok: response.ok, message: text }
+      if (response.ok && result.pending) {
+        // Store request ID for better tracking
+        setCurrentRequestId(result.requestId)
+        
+        // Start polling with the correct timeout based on message type
+        startPolling(result.isSoftSkills || shouldDelay)
+      } else if (response.ok) {
+        // Immediate response (shouldn't happen with async pattern, but handle it)
+        setIsLoading(false)
+        const systemMessage: Message = {
+          id: `${Date.now()}`,
+          type: "api",
+          content: result.message || "Message sent",
+          timestamp: new Date(),
         }
-      } catch {
-        result = { ok: false, message: "Failed to read response" }
+        setMessages((prev) => [...prev, systemMessage])
+      } else {
+        setIsLoading(false)
+        const errorMessage: Message = {
+          id: `${Date.now()}`,
+          type: "system",
+          content: result.error || "Failed to send message",
+          timestamp: new Date(),
+        }
+        setMessages((prev) => [...prev, errorMessage])
       }
-
-      displayMessage =
-        (result && typeof result.message === "string" && result.message) ||
-        (typeof result === "string" ? result : JSON.stringify(result))
-
-      if (needsSoftSkillsWait) {
-        await new Promise((resolve) => setTimeout(resolve, 120_000))
-      }
-
-      const systemMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        type: response.ok ? "api" : "system",
-        content: displayMessage,
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, systemMessage])
     } catch (error) {
       console.error("Error calling API:", error)
+      setIsLoading(false)
       const errorMessage: Message = {
-        id: (Date.now() + 2).toString(),
+        id: `${Date.now()}`,
         type: "system",
-        content: `Network error while contacting webhook. Please try again. ${
+        content: `Network error. Please try again. ${
           error instanceof Error ? error.message : ""
         }`,
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, errorMessage])
-    } finally {
-      setIsLoading(false)
     }
   }
 
@@ -273,6 +387,24 @@ export default function SurikadoChat() {
       </div>
 
       <div className="max-w-4xl mx-auto p-4 h-[calc(100vh-80px)]">
+        {/* Enhanced loading indicator that shows timeout info */}
+        {isPolling && (
+          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+            <div className="flex items-center gap-2 text-blue-700">
+              <div className="flex items-center gap-1">
+                <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
+                <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.1s" }}></div>
+                <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.2s" }}></div>
+              </div>
+              <span className="text-sm">
+                {shouldDelayForSoftSkills(messages) 
+                  ? "Processing your soft skills query (may take up to 3 minutes)..." 
+                  : "Processing your message..."}
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* JSON toggle display section at the top */}
         {parsedResume && (
           <Card className="mb-4 shadow-lg">
@@ -331,7 +463,7 @@ export default function SurikadoChat() {
                   </div>
                 ))
               )}
-              {isLoading && (
+              {isLoading && !isPolling && (
                 <div className="flex justify-start">
                   <div className="bg-gray-100 text-gray-800 px-4 py-2 rounded-lg">
                     <div className="flex items-center gap-2">
@@ -344,6 +476,7 @@ export default function SurikadoChat() {
                         className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
                         style={{ animationDelay: "0.2s" }}
                       ></div>
+                      <span className="ml-2 text-sm">Sending message...</span>
                     </div>
                   </div>
                 </div>
@@ -356,8 +489,9 @@ export default function SurikadoChat() {
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
                 placeholder="Type your message..."
-                onKeyPress={(e) => e.key === "Enter" && handleSendMessage()}
+                onKeyPress={(e) => e.key === "Enter" && !isLoading && handleSendMessage()}
                 className="flex-1"
+                disabled={isLoading}
               />
               <Button onClick={handleSendMessage} disabled={isLoading}>
                 <Send className="w-4 h-4" />

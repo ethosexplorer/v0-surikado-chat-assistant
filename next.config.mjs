@@ -1,14 +1,17 @@
+// In your next.config.js
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  eslint: {
-    ignoreDuringBuilds: true,
+  experimental: {
+    serverComponentsExternalPackages: [],
   },
-  typescript: {
-    ignoreBuildErrors: true,
-  },
-  images: {
-    unoptimized: true,
+  api: {
+    responseLimit: '10mb',
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+    // If using Vercel, this might help
+    externalResolver: true,
   },
 }
 
-export default nextConfig
+module.exports = nextConfig
