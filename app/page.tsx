@@ -4,11 +4,11 @@ import { useState, useRef, useEffect } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
-import { MessageCircle, Send, Trash2, FileText, ChevronDown, ChevronUp } from "lucide-react"
+import { MessageCircle, Send, Trash2, FileText } from "lucide-react"
 
 interface Message {
   id: string
-  type: "user" | "system" | "api"
+  type: "user" | "system" | "api" | "typing"
   content: string
   timestamp: Date
 }
@@ -21,15 +21,14 @@ export default function SurikadoChat() {
   const [showParsedJSON, setShowParsedJSON] = useState(false)
   const [parsedResume, setParsedResume] = useState<any>(null)
   const [toPhone, setToPhone] = useState("")
-  
-  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
-  const [isPolling, setIsPolling] = useState(false)
-  const [currentRequestId, setCurrentRequestId] = useState<string>("")
 
-  // DYNAMIC TIMEOUTS BASED ON MESSAGE TYPE
-  const SOFT_SKILLS_TIMEOUT_MS = 180_000 // 3 minutes for soft skills
-  const NORMAL_TIMEOUT_MS = 120_000 // 2 minutes for normal messages
-  const POLL_INTERVAL_MS = 3_000 // Poll every 3 seconds
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const typingIntervalRef = useRef<NodeJS.Timeout | null>(null)
+  const [isPolling, setIsPolling] = useState(false)
+  const [isSoftSkillsQuery, setIsSoftSkillsQuery] = useState(false)
+
+  const POLL_INTERVAL_MS = 3_000
+  const TYPING_INTERVAL_MS = 10_000 // 10 seconds
 
   const shouldDelayForSoftSkills = (msgs: Message[]) => {
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -65,105 +64,154 @@ export default function SurikadoChat() {
       clearInterval(pollingIntervalRef.current)
       pollingIntervalRef.current = null
     }
+    stopTypingIndicator()
     setIsPolling(false)
     setIsLoading(false)
-    setCurrentRequestId("")
+    setIsSoftSkillsQuery(false)
   }
 
-  const pollForResponse = async (startTime: number, isSoftSkills: boolean) => {
+  const stopTypingIndicator = () => {
+    if (typingIntervalRef.current) {
+      clearInterval(typingIntervalRef.current)
+      typingIntervalRef.current = null
+    }
+    // Remove typing indicators
+    setMessages((prev) => prev.filter((msg) => msg.type !== "typing"))
+  }
+
+  const startTypingIndicator = () => {
+    console.log("[typing] Starting empty message indicators every 10 seconds")
+
+    // Add first empty message immediately
+    const firstTypingMessage: Message = {
+      id: `typing-${Date.now()}`,
+      type: "typing",
+      content: "...",
+      timestamp: new Date(),
+    }
+    setMessages((prev) => [...prev, firstTypingMessage])
+
+    // Continue adding empty messages every 10 seconds
+    typingIntervalRef.current = setInterval(() => {
+      console.log("[typing] Adding new empty message")
+
+      const newTypingMessage: Message = {
+        id: `typing-${Date.now()}`,
+        type: "typing",
+        content: "...",
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, newTypingMessage])
+    }, TYPING_INTERVAL_MS)
+  }
+
+  const pollForResponse = async () => {
     try {
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           action: "poll",
-          toPhone: normalizeWhatsApp(toPhone) 
+          toPhone: normalizeWhatsApp(toPhone), // was userPhone (undefined)
         }),
       })
 
-      const result = await response.json()
+      const contentType = response.headers.get("content-type") || ""
+      let result: any
+      if (contentType.includes("application/json")) {
+        result = await response.json()
+      } else {
+        const text = await response.text()
+        result = { status: response.ok ? "text" : "error", message: text }
+      }
 
-      // DYNAMIC TIMEOUT BASED ON MESSAGE TYPE
-      const timeoutMs = isSoftSkills ? SOFT_SKILLS_TIMEOUT_MS : NORMAL_TIMEOUT_MS
-      
-      // Check if we've been polling too long
-      if (Date.now() - startTime > timeoutMs) {
+      if (!response.ok) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "system",
+            content: result?.message || "Polling failed",
+            timestamp: new Date(),
+          },
+        ])
         stopPolling()
-        const timeoutMessage: Message = {
-          id: `${Date.now()}`,
-          type: "system",
-          content: `Response timeout after ${timeoutMs/1000} seconds. The request is taking longer than expected.`,
-          timestamp: new Date(),
-        }
-        setMessages((prev) => [...prev, timeoutMessage])
         return
       }
 
-      if (result.status === 'completed') {
+      if (result.status === "empty") {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "api",
+            content: result.message || "...",
+            timestamp: new Date(),
+          },
+        ])
+      } else if (result.status === "completed") {
         stopPolling()
-        
-        // Add a small delay for better UX (optional)
-        await new Promise((resolve) => setTimeout(resolve, 500))
-        
-        const systemMessage: Message = {
-          id: `${Date.now()}`,
-          type: "api",
-          content: result.message || "Response received",
-          timestamp: new Date(),
-        }
-        setMessages((prev) => [...prev, systemMessage])
-      } else if (result.status === 'error') {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "api",
+            content: result.message || "Response received",
+            timestamp: new Date(),
+          },
+        ])
+      } else if (result.status === "error") {
         stopPolling()
-        const errorMessage: Message = {
-          id: `${Date.now()}`,
-          type: "system",
-          content: result.message || "An error occurred processing your request",
-          timestamp: new Date(),
-        }
-        setMessages((prev) => [...prev, errorMessage])
-      } else if (result.status === 'expired') {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "system",
+            content: result.message || "An error occurred",
+            timestamp: new Date(),
+          },
+        ])
+      } else if (result.status === "expired") {
         stopPolling()
-        const expiredMessage: Message = {
-          id: `${Date.now()}`,
-          type: "system",
-          content: "Request expired. Please try your message again.",
-          timestamp: new Date(),
-        }
-        setMessages((prev) => [...prev, expiredMessage])
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "system",
+            content: "Request expired",
+            timestamp: new Date(),
+          },
+        ])
       }
-      // If status is 'pending', continue polling
+      // pending/none: keep polling silently
     } catch (error) {
-      console.error("Error polling for response:", error)
-      stopPolling()
-      const errorMessage: Message = {
-        id: `${Date.now()}`,
-        type: "system",
-        content: "Error checking for response. Please try again.",
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, errorMessage])
+      console.error("[v0] Error polling for response:", error)
+      // continue polling on network errors
     }
   }
 
   const startPolling = (isSoftSkills: boolean) => {
-    const startTime = Date.now()
     setIsPolling(true)
+    setIsSoftSkillsQuery(isSoftSkills)
+
+    // Start empty messages for soft skills queries
+    if (isSoftSkills) {
+      startTypingIndicator()
+    }
 
     // Poll immediately
-    pollForResponse(startTime, isSoftSkills)
+    pollForResponse()
 
     // Then poll every POLL_INTERVAL_MS
     pollingIntervalRef.current = setInterval(() => {
-      pollForResponse(startTime, isSoftSkills)
+      pollForResponse()
     }, POLL_INTERVAL_MS)
   }
 
-  // Cleanup polling on unmount
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (pollingIntervalRef.current) {
-        clearInterval(pollingIntervalRef.current)
-      }
+      stopPolling()
     }
   }, [])
 
@@ -174,7 +222,7 @@ export default function SurikadoChat() {
       const warn: Message = {
         id: `${Date.now()}`,
         type: "system",
-        content: "Please enter your WhatsApp number (e.g., +123456789) before sending.",
+        content: "Please enter your WhatsApp number",
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, warn])
@@ -193,29 +241,24 @@ export default function SurikadoChat() {
     setInputMessage("")
     setIsLoading(true)
 
-    const shouldDelay = shouldDelayForSoftSkills(messages)
+    const isSoftSkills = shouldDelayForSoftSkills(messages)
 
     try {
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ 
+        body: JSON.stringify({
           action: "send",
-          message: messageToSend, 
-          toPhone: normalizeWhatsApp(toPhone) 
+          message: messageToSend,
+          toPhone: normalizeWhatsApp(toPhone),
         }),
       })
 
       const result = await response.json()
 
       if (response.ok && result.pending) {
-        // Store request ID for better tracking
-        setCurrentRequestId(result.requestId)
-        
-        // Start polling with the correct timeout based on message type
-        startPolling(result.isSoftSkills || shouldDelay)
+        startPolling(result.isSoftSkills || isSoftSkills)
       } else if (response.ok) {
-        // Immediate response (shouldn't happen with async pattern, but handle it)
         setIsLoading(false)
         const systemMessage: Message = {
           id: `${Date.now()}`,
@@ -238,11 +281,9 @@ export default function SurikadoChat() {
       console.error("Error calling API:", error)
       setIsLoading(false)
       const errorMessage: Message = {
-        id: `${Date.now()}`,
+        id: Date.now().toString(),
         type: "system",
-        content: `Network error. Please try again. ${
-          error instanceof Error ? error.message : ""
-        }`,
+        content: "Network error. Please try again.",
         timestamp: new Date(),
       }
       setMessages((prev) => [...prev, errorMessage])
@@ -346,7 +387,7 @@ export default function SurikadoChat() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
-      {/* Header */}
+      {/* Header - same as before */}
       <div className="bg-blue-600 text-white p-4 shadow-lg">
         <div className="max-w-4xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -387,51 +428,6 @@ export default function SurikadoChat() {
       </div>
 
       <div className="max-w-4xl mx-auto p-4 h-[calc(100vh-80px)]">
-        {/* Enhanced loading indicator that shows timeout info */}
-        {isPolling && (
-          <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-            <div className="flex items-center gap-2 text-blue-700">
-              <div className="flex items-center gap-1">
-                <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
-                <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.1s" }}></div>
-                <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.2s" }}></div>
-              </div>
-              <span className="text-sm">
-                {shouldDelayForSoftSkills(messages) 
-                  ? "Processing your soft skills query (may take up to 3 minutes)..." 
-                  : "Processing your message..."}
-              </span>
-            </div>
-          </div>
-        )}
-
-        {/* JSON toggle display section at the top */}
-        {parsedResume && (
-          <Card className="mb-4 shadow-lg">
-            <div className="p-4">
-              <Button
-                variant="ghost"
-                onClick={() => setShowParsedJSON(!showParsedJSON)}
-                className="w-full flex items-center justify-between text-left p-0 h-auto"
-              >
-                <span className="font-semibold text-blue-600">Parsed Resume JSON</span>
-                {showParsedJSON ? (
-                  <ChevronUp className="w-4 h-4 text-blue-600" />
-                ) : (
-                  <ChevronDown className="w-4 h-4 text-blue-600" />
-                )}
-              </Button>
-              {showParsedJSON && (
-                <div className="mt-4 p-4 bg-gray-50 rounded-lg">
-                  <pre className="text-sm text-gray-800 whitespace-pre-wrap overflow-x-auto">
-                    {JSON.stringify(parsedResume, null, 2)}
-                  </pre>
-                </div>
-              )}
-            </div>
-          </Card>
-        )}
-
         {/* Chat Window */}
         <Card className="h-full p-4 shadow-lg">
           <div className="h-full flex flex-col">
@@ -453,12 +449,33 @@ export default function SurikadoChat() {
                         message.type === "user"
                           ? "bg-blue-600 text-white"
                           : message.type === "api"
-                            ? "bg-green-100 text-green-800"
-                            : "bg-gray-100 text-gray-800"
+                            ? "bg-green-100 text-green-800 border border-green-200"
+                            : message.type === "typing"
+                              ? "bg-gray-100 text-gray-500 border border-gray-200 italic"
+                              : "bg-gray-100 text-gray-800"
                       }`}
                     >
-                      <p className="text-sm">{message.content}</p>
-                      <p className="text-xs opacity-70 mt-1">{message.timestamp.toLocaleTimeString()}</p>
+                      {message.type === "typing" ? (
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm">Thinking</span>
+                          <div className="flex gap-1">
+                            <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"></div>
+                            <div
+                              className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"
+                              style={{ animationDelay: "0.1s" }}
+                            ></div>
+                            <div
+                              className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"
+                              style={{ animationDelay: "0.2s" }}
+                            ></div>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+                          <p className="text-xs opacity-70 mt-1">{message.timestamp.toLocaleTimeString()}</p>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))

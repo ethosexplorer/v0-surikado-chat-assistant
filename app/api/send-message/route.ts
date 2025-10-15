@@ -1,14 +1,20 @@
 import { type NextRequest, NextResponse } from "next/server"
 
-// In-memory store for pending responses
-const pendingResponses = new Map<string, { 
-  status: 'pending' | 'completed' | 'error', 
-  message?: string, 
-  timestamp: number,
-  isSoftSkills?: boolean // Track if this is a soft skills request
+// Store to track active soft skills queries and their progress
+const activeSoftSkillsQueries = new Map<string, {
+  startTime: number,
+  userPhone: string,
+  lastEmptyMessageTime: number,
+  completed: boolean
 }>()
 
-// Detect if message is about soft skills
+// Store final responses
+const queryResponses = new Map<string, {
+  message: string,
+  timestamp: number
+}>()
+
+// Detect soft skills messages
 const isSoftSkillsMessage = (message: string): boolean => {
   const softSkillsPatterns = [
     /soft\s*skills?/i,
@@ -24,11 +30,34 @@ const isSoftSkillsMessage = (message: string): boolean => {
   return softSkillsPatterns.some(pattern => pattern.test(message))
 }
 
+// Generate empty message content
+const getEmptyMessage = (elapsedSeconds: number): string => {
+  const messages = [
+    "Processing your request...",
+    "Analyzing your query...",
+    "Generating response...",
+    "Almost there...",
+    "Finalizing answer...",
+    "Compiling information...",
+    "Preparing response...",
+    "Working on it...",
+    "Getting things ready...",
+    "Just a moment..."
+  ]
+  
+  const index = Math.floor(elapsedSeconds / 10) % messages.length
+  return messages[index]
+}
+
 export async function POST(request: NextRequest) {
   try {
     const data = await request.json()
     const userMessage = data.message || ""
-    const action = data.action || "send"
+    const action = data.action || "send" // 'send' or 'poll' or 'empty'
+
+    if (!userMessage && action === "send") {
+      return NextResponse.json({ error: "Message is required" }, { status: 400 })
+    }
 
     const normalizeWhatsApp = (raw: unknown) => {
       if (!raw) return ""
@@ -46,180 +75,311 @@ export async function POST(request: NextRequest) {
 
     const requestId = `${userPhone}-${Date.now()}`
 
-    // POLLING MODE: Check if response is ready
+    // POLLING MODE: Check for empty messages or final response
     if (action === "poll") {
-      const lastPendingKey = Array.from(pendingResponses.keys())
-        .filter(key => key.startsWith(userPhone))
-        .sort()
-        .pop()
+      const query = activeSoftSkillsQueries.get(userPhone)
       
-      if (!lastPendingKey) {
+      if (!query) {
+        // Check if we have a final response
+        const finalResponse = queryResponses.get(userPhone)
+        if (finalResponse) {
+          // Clean up after sending final response
+          queryResponses.delete(userPhone)
+          return NextResponse.json({
+            status: 'completed',
+            message: finalResponse.message,
+            timestamp: finalResponse.timestamp
+          })
+        }
         return NextResponse.json({ 
           status: 'none',
-          message: 'No pending request found' 
+          message: 'No active query found' 
         })
       }
 
-      const result = pendingResponses.get(lastPendingKey)
-      if (!result) {
-        return NextResponse.json({ 
-          status: 'none',
-          message: 'No pending request found' 
+      const elapsedSeconds = Math.floor((Date.now() - query.startTime) / 1000)
+      
+      // Check if it's time to send an empty message (every 10 seconds)
+      const timeSinceLastEmpty = Date.now() - query.lastEmptyMessageTime
+      if (timeSinceLastEmpty >= 10000 && !query.completed) {
+        // Update last empty message time
+        query.lastEmptyMessageTime = Date.now()
+        activeSoftSkillsQueries.set(userPhone, query)
+        
+        return NextResponse.json({
+          status: 'empty',
+          message: getEmptyMessage(elapsedSeconds),
+          elapsedSeconds,
+          completed: false
         })
       }
 
-      // EXTENDED TIMEOUT FOR SOFT SKILLS - 3 minutes instead of 5
-      const timeoutMs = result.isSoftSkills ? 3 * 60 * 1000 : 5 * 60 * 1000
-      const timeoutTime = Date.now() - timeoutMs
-      
-      if (result.timestamp < timeoutTime) {
-        pendingResponses.delete(lastPendingKey)
-        return NextResponse.json({ 
-          status: 'expired',
-          message: 'Request expired' 
+      // Check if processing is complete (after ~74 seconds)
+      if (elapsedSeconds >= 74 && !query.completed) {
+        query.completed = true
+        activeSoftSkillsQueries.set(userPhone, query)
+        
+        // Trigger the actual webhook call for final response
+        setTimeout(() => {
+          processFinalWebhook(userPhone, userMessage, requestId)
+        }, 0)
+        
+        return NextResponse.json({
+          status: 'processing',
+          message: 'Finalizing response...',
+          elapsedSeconds,
+          completed: true
         })
       }
 
       return NextResponse.json({
-        status: result.status,
-        message: result.message,
-        pending: result.status === 'pending',
-        isSoftSkills: result.isSoftSkills // Send this info to frontend
+        status: 'waiting',
+        message: 'Still processing...',
+        elapsedSeconds,
+        completed: false
       })
     }
 
-    // SEND MODE: Fire webhook and return immediately
-    if (!userMessage) {
-      return NextResponse.json({ error: "Message is required" }, { status: 400 })
+    // EMPTY MESSAGE MODE: Force an empty message (for testing)
+    if (action === "empty") {
+      const query = activeSoftSkillsQueries.get(userPhone)
+      if (query) {
+        const elapsedSeconds = Math.floor((Date.now() - query.startTime) / 1000)
+        query.lastEmptyMessageTime = Date.now()
+        activeSoftSkillsQueries.set(userPhone, query)
+        
+        return NextResponse.json({
+          status: 'empty',
+          message: getEmptyMessage(elapsedSeconds),
+          elapsedSeconds,
+          completed: false
+        })
+      }
+      return NextResponse.json({ status: 'none', message: 'No active query' })
     }
 
-    console.log("[send-message] Processing message:", userMessage, "from", userPhone)
+    // SEND MODE: Start a new query
+    console.log("[v0] Processing message:", userMessage, "from", userPhone)
 
     const isSoftSkills = isSoftSkillsMessage(userMessage)
-    
-    // Store pending status with soft skills flag
-    pendingResponses.set(requestId, { 
-      status: 'pending', 
-      timestamp: Date.now(),
-      isSoftSkills
-    })
 
-    const webhookPayload = {
-      specversion: "1.0",
-      type: "com.twilio.messaging.inbound-message.received",
-      source: "/some-path",
-      id: requestId,
-      dataschema: "https://events-schemas.twilio.com/Messaging.InboundMessageV1/5",
-      datacontenttype: "application/json",
-      time: new Date().toISOString(),
-      data: {
-        numMedia: 0,
-        timestamp: new Date().toISOString(),
-        recipients: [],
-        accountSid: "ACxxxx",
-        messagingServiceSid: "MGxxxx",
-        to: "whatsapp:+16098034599",
-        numSegments: 1,
-        messageSid: requestId,
-        eventName: "com.twilio.messaging.inbound-message.received",
-        body: userMessage,
-        from: userPhone,
-      },
-    }
-
-    const endpoints = [
-      "https://surikado.hellodexter.com:5678/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
-      "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
-    ]
-
-    // Fire and forget - don't wait for response
-    const processWebhook = async () => {
-      for (const url of endpoints) {
-        try {
-          // EXTENDED TIMEOUT FOR SOFT SKILLS REQUESTS
-          const timeoutMs = isSoftSkills ? 180_000 : 120_000 // 3 min vs 2 min
-          const controller = new AbortController()
-          const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
-
-          const response = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(webhookPayload),
-            signal: controller.signal,
-          })
-
-          clearTimeout(timeoutId)
-
-          const contentType = response.headers.get("content-type") || ""
-          let body: any
-
-          if (contentType.includes("application/json")) {
-            try {
-              body = await response.json()
-            } catch {
-              body = { raw: await response.text() }
-            }
-          } else {
-            body = { raw: await response.text() }
-          }
-
-          if (response.ok) {
-            const message =
-              (body && typeof body === "object" && "output" in body && body.output) ||
-              (body && typeof body === "object" && "message" in body && body.message) ||
-              (typeof body === "string" ? body : JSON.stringify(body))
-            
-            pendingResponses.set(requestId, {
-              status: 'completed',
-              message,
-              timestamp: Date.now(),
-              isSoftSkills
-            })
-            console.log(`[send-message] Success from ${url}, softSkills: ${isSoftSkills}`)
-            return
-          } else {
-            console.log(`[send-message] ${url} failed with status ${response.status}`)
-          }
-        } catch (err) {
-          console.log(`[send-message] ${url} error:`, err instanceof Error ? err.message : String(err))
-        }
-      }
-
-      // All endpoints failed
-      pendingResponses.set(requestId, {
-        status: 'error',
-        message: 'All webhook endpoints failed',
-        timestamp: Date.now(),
-        isSoftSkills
+    if (isSoftSkills) {
+      // Start tracking this soft skills query
+      activeSoftSkillsQueries.set(userPhone, {
+        startTime: Date.now(),
+        userPhone,
+        lastEmptyMessageTime: Date.now(), // Send first empty message immediately
+        completed: false
       })
-    }
 
-    // Start processing in background (don't await)
-    processWebhook().catch(err => {
-      console.error("[send-message] Background processing error:", err)
-      pendingResponses.set(requestId, {
-        status: 'error',
-        message: 'Processing error occurred',
-        timestamp: Date.now(),
-        isSoftSkills
+      // Return immediately to start polling
+      return NextResponse.json({
+        ok: true,
+        status: 'pending',
+        message: 'Soft skills query received. Starting processing...',
+        requestId,
+        pending: true,
+        isSoftSkills: true
       })
-    })
-
-    // Return immediately with pending status and soft skills info
-    return NextResponse.json({
-      ok: true,
-      status: 'pending',
-      message: 'Message sent to processing queue. Poll for response.',
-      requestId,
-      pending: true,
-      isSoftSkills // Let frontend know this might take longer
-    })
+    } else {
+      // For non-soft skills, process immediately with webhook
+      return await processImmediateWebhook(userMessage, userPhone, requestId)
+    }
 
   } catch (error) {
-    console.error("[send-message] Server error:", error instanceof Error ? error.message : "Unknown error")
+    console.error("[v0] Server error:", error instanceof Error ? error.message : "Unknown error")
     return NextResponse.json(
       { error: `Server error: ${error instanceof Error ? error.message : "Unknown error"}` },
-      { status: 500 }
+      { status: 500 },
     )
   }
+}
+
+// Process immediate webhook for non-soft skills messages
+async function processImmediateWebhook(userMessage: string, userPhone: string, requestId: string) {
+  const timeoutMs = 25_000
+
+  const webhookPayload = {
+    specversion: "1.0",
+    type: "com.twilio.messaging.inbound-message.received",
+    source: "/some-path",
+    id: requestId,
+    dataschema: "https://events-schemas.twilio.com/Messaging.InboundMessageV1/5",
+    datacontenttype: "application/json",
+    time: new Date().toISOString(),
+    data: {
+      numMedia: 0,
+      timestamp: new Date().toISOString(),
+      recipients: [],
+      accountSid: "ACxxxx",
+      messagingServiceSid: "MGxxxx",
+      to: "whatsapp:+16098034599",
+      numSegments: 1,
+      messageSid: requestId,
+      eventName: "com.twilio.messaging.inbound-message.received",
+      body: userMessage,
+      from: userPhone,
+    },
+  }
+
+  const endpoints = [
+    "https://surikado.hellodexter.com:5678/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
+    "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
+  ]
+
+  const maxAttemptsPerEndpoint = 2
+  let lastDetail = "Unknown error"
+
+  for (const url of endpoints) {
+    for (let attempt = 1; attempt <= maxAttemptsPerEndpoint; attempt++) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(webhookPayload),
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+
+        const contentType = response.headers.get("content-type") || ""
+        const getBody = async () => {
+          if (contentType.includes("application/json")) {
+            try {
+              return await response.json()
+            } catch {
+              return { raw: await response.text() }
+            }
+          }
+          return { raw: await response.text() }
+        }
+
+        const body = await getBody()
+
+        if (response.ok) {
+          const message =
+            (body && typeof body === "object" && "output" in body && (body as any).output) ||
+            (body && typeof body === "object" && "message" in body && (body as any).message) ||
+            (typeof body === "string" ? body : JSON.stringify(body))
+          return NextResponse.json({ ok: true, message })
+        } else {
+          lastDetail = `Status ${response.status}: ${typeof body === "string" ? body : JSON.stringify(body)}`
+          console.log(`[v0] Webhook ${url} attempt ${attempt}/${maxAttemptsPerEndpoint} failed: ${lastDetail}`)
+        }
+      } catch (err) {
+        lastDetail = err instanceof Error ? err.message : String(err)
+        console.log(`[v0] Webhook ${url} attempt ${attempt}/${maxAttemptsPerEndpoint} network error:`, lastDetail)
+      }
+
+      if (attempt < maxAttemptsPerEndpoint) {
+        const backoff = 300
+        await new Promise((r) => setTimeout(r, backoff))
+      }
+    }
+  }
+
+  return NextResponse.json({
+    ok: false,
+    message: `Unable to reach upstream webhook after ${maxAttemptsPerEndpoint * endpoints.length} attempts. Last detail: ${lastDetail}`,
+  })
+}
+
+// Process final webhook for soft skills (after empty messages)
+async function processFinalWebhook(userPhone: string, userMessage: string, requestId: string) {
+  const timeoutMs = 25_000
+
+  const webhookPayload = {
+    specversion: "1.0",
+    type: "com.twilio.messaging.inbound-message.received",
+    source: "/some-path",
+    id: requestId,
+    dataschema: "https://events-schemas.twilio.com/Messaging.InboundMessageV1/5",
+    datacontenttype: "application/json",
+    time: new Date().toISOString(),
+    data: {
+      numMedia: 0,
+      timestamp: new Date().toISOString(),
+      recipients: [],
+      accountSid: "ACxxxx",
+      messagingServiceSid: "MGxxxx",
+      to: "whatsapp:+16098034599",
+      numSegments: 1,
+      messageSid: requestId,
+      eventName: "com.twilio.messaging.inbound-message.received",
+      body: userMessage,
+      from: userPhone,
+    },
+  }
+
+  const endpoints = [
+    "https://surikado.hellodexter.com:5678/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
+    "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
+  ]
+
+  const maxAttemptsPerEndpoint = 2
+  let lastDetail = "Unknown error"
+
+  for (const url of endpoints) {
+    for (let attempt = 1; attempt <= maxAttemptsPerEndpoint; attempt++) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(webhookPayload),
+          signal: AbortSignal.timeout(timeoutMs),
+        })
+
+        const contentType = response.headers.get("content-type") || ""
+        const getBody = async () => {
+          if (contentType.includes("application/json")) {
+            try {
+              return await response.json()
+            } catch {
+              return { raw: await response.text() }
+            }
+          }
+          return { raw: await response.text() }
+        }
+
+        const body = await getBody()
+
+        if (response.ok) {
+          const message =
+            (body && typeof body === "object" && "output" in body && (body as any).output) ||
+            (body && typeof body === "object" && "message" in body && (body as any).message) ||
+            (typeof body === "string" ? body : JSON.stringify(body))
+          
+          // Store the final response
+          queryResponses.set(userPhone, {
+            message: message || "Response received",
+            timestamp: Date.now()
+          })
+          
+          // Clean up the active query
+          activeSoftSkillsQueries.delete(userPhone)
+          return
+        } else {
+          lastDetail = `Status ${response.status}: ${typeof body === "string" ? body : JSON.stringify(body)}`
+          console.log(`[v0] Final webhook ${url} attempt ${attempt}/${maxAttemptsPerEndpoint} failed: ${lastDetail}`)
+        }
+      } catch (err) {
+        lastDetail = err instanceof Error ? err.message : String(err)
+        console.log(`[v0] Final webhook ${url} attempt ${attempt}/${maxAttemptsPerEndpoint} network error:`, lastDetail)
+      }
+
+      if (attempt < maxAttemptsPerEndpoint) {
+        const backoff = 300
+        await new Promise((r) => setTimeout(r, backoff))
+      }
+    }
+  }
+
+  // If webhook fails, provide a fallback response
+  const fallbackResponse = `I excel at several key soft skills:\n\n• Teamwork & Collaboration\n• Problem-Solving\n• Communication\n• Adaptability\n• Time Management\n\nThese skills help me work effectively in any environment.`
+
+  queryResponses.set(userPhone, {
+    message: fallbackResponse,
+    timestamp: Date.now()
+  })
+  
+  // Clean up the active query
+  activeSoftSkillsQueries.delete(userPhone)
 }

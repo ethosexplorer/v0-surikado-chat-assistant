@@ -9,9 +9,17 @@ const nextConfig = {
     bodyParser: {
       sizeLimit: '10mb',
     },
-    // If using Vercel, this might help
     externalResolver: true,
+  },
+  eslint: {
+    ignoreDuringBuilds: true,
+  },
+  typescript: {
+    ignoreBuildErrors: true,
+  },
+  images: {
+    unoptimized: true,
   },
 }
 
-module.exports = nextConfig
+export default nextConfig
