@@ -16,7 +16,9 @@ const activeConversations = new Map<
     emptyMessageCount: number
     webhookStartTime?: number
     processingStarted: boolean
-    lastPollTime: number // NEW: Track last poll time
+    lastPollTime: number
+    webhookCompleted: boolean
+    rapidPollingStarted: boolean // NEW: Track rapid polling state
   }
 >()
 
@@ -30,11 +32,13 @@ const conversationResponses = new Map<
   }
 >()
 
-// TIMING CONFIGURATION
+// TIMING CONFIGURATION - OPTIMIZED FOR RAPID POLLING
 const EMPTY_MESSAGE_INTERVAL = 8000 // Send empty message every 8 seconds
-const API_CALL_TIME = 88 // Call n8n API after 88 seconds
-const MAX_TOTAL_TIME = 180 // Absolute max 3 minutes before forcing error
-const POLL_TIMEOUT = 30000 // NEW: 30 seconds poll timeout
+const API_CALL_TIME = 3 // Call n8n API after 3 seconds
+const RAPID_POLLING_START_TIME = 70 // Start rapid polling after 70 seconds (1:10 mins)
+const MAX_TOTAL_TIME = 120 // Absolute max 2 minutes
+const POLL_TIMEOUT = 45000 // 45 seconds poll timeout
+const WEBHOOK_TIMEOUT = 90000 // 90 seconds for webhook to complete
 
 // Cleanup old data every minute
 const CLEANUP_INTERVAL = 60000
@@ -126,16 +130,27 @@ export async function POST(request: NextRequest) {
         })
       }
 
-      // NEW: Update last poll time to prevent timeout
+      // Update last poll time to prevent timeout
       conversation.lastPollTime = Date.now()
       activeConversations.set(userPhone, conversation)
 
       const elapsedSeconds = Math.floor((Date.now() - conversation.startTime) / 1000)
+      const totalProcessingTime = conversation.webhookStartTime 
+        ? Math.floor((Date.now() - conversation.webhookStartTime) / 1000)
+        : 0
+
       console.log(
-        `[poll] Elapsed: ${elapsedSeconds}s, WebhookCalled: ${conversation.webhookCalled}, Completed: ${conversation.completed}`,
+        `[poll] Elapsed: ${elapsedSeconds}s, Processing: ${totalProcessingTime}s, WebhookCalled: ${conversation.webhookCalled}, RapidPolling: ${conversation.rapidPollingStarted}`,
       )
 
-      // NEW: Check if polling has timed out (no polls for 30 seconds)
+      // NEW: Check if we should start rapid polling (after 70 seconds)
+      if (elapsedSeconds >= RAPID_POLLING_START_TIME && !conversation.rapidPollingStarted) {
+        conversation.rapidPollingStarted = true
+        activeConversations.set(userPhone, conversation)
+        console.log(`[poll] 🚀 STARTING RAPID POLLING at ${elapsedSeconds}s`)
+      }
+
+      // Check if polling has timed out (no polls for 45 seconds)
       const timeSinceLastPoll = Date.now() - conversation.lastPollTime
       if (timeSinceLastPoll > POLL_TIMEOUT) {
         console.error(`[poll] POLLING TIMEOUT - No polls for ${timeSinceLastPoll}ms`)
@@ -143,11 +158,28 @@ export async function POST(request: NextRequest) {
         conversationResponses.delete(userPhone)
         return NextResponse.json({
           status: "timeout",
-          message: "Polling session expired. Please send your message again.",
+          message: "Session expired. Please send your message again.",
           elapsedSeconds,
           completed: true,
           success: false,
         })
+      }
+
+      // Check if webhook is taking too long to complete
+      if (conversation.webhookCalled && !conversation.webhookCompleted && conversation.webhookStartTime) {
+        const webhookElapsed = Date.now() - conversation.webhookStartTime
+        if (webhookElapsed > WEBHOOK_TIMEOUT) {
+          console.error(`[poll] WEBHOOK TIMEOUT after ${Math.floor(webhookElapsed / 1000)}s`)
+          activeConversations.delete(userPhone)
+          conversationResponses.delete(userPhone)
+          return NextResponse.json({
+            status: "completed",
+            message: "The request is taking longer than expected. Please try again.",
+            elapsedSeconds,
+            completed: true,
+            success: false,
+          })
+        }
       }
 
       // ABSOLUTE TIMEOUT - Force error if taking too long
@@ -157,7 +189,7 @@ export async function POST(request: NextRequest) {
         conversationResponses.delete(userPhone)
         return NextResponse.json({
           status: "completed",
-          message: "I apologize for the delay. Please try sending your soft skills again.",
+          message: "I apologize for the delay. Please try sending your message again.",
           elapsedSeconds,
           completed: true,
           success: false,
@@ -192,7 +224,7 @@ export async function POST(request: NextRequest) {
         }
       }
 
-      // Check if it's time to call the API (at 88 seconds)
+      // Check if it's time to call the API (at 3 seconds)
       if (elapsedSeconds >= API_CALL_TIME && !conversation.webhookCalled) {
         console.log(`[poll] ⏰ Reached ${API_CALL_TIME}s - CALLING API NOW`)
 
@@ -207,7 +239,7 @@ export async function POST(request: NextRequest) {
         // Return processing status
         return NextResponse.json({
           status: "processing",
-          message: "⚡ Processing your information...",
+          message: "⚡ Starting to process your soft skills...",
           elapsedSeconds,
           completed: false,
         })
@@ -219,13 +251,26 @@ export async function POST(request: NextRequest) {
           ? Math.floor((Date.now() - conversation.webhookStartTime) / 1000)
           : 0
 
-        console.log(`[poll] API still processing... (${webhookElapsed}s since webhook call)`)
+        console.log(`[poll] API processing for ${webhookElapsed}s`)
+
+        // Show more specific messages based on processing time
+        let processingMessage = "⚡ Processing your information..."
+        if (webhookElapsed > 60) {
+          processingMessage = "🔄 Finalizing your analysis... Almost done!"
+        } else if (webhookElapsed > 45) {
+          processingMessage = "📊 Compiling your soft skills assessment..."
+        } else if (webhookElapsed > 30) {
+          processingMessage = "💡 Analyzing your strengths and opportunities..."
+        } else if (webhookElapsed > 15) {
+          processingMessage = "🎯 Processing your response..."
+        }
 
         return NextResponse.json({
           status: "processing",
-          message: "⚡ Processing your information...",
+          message: processingMessage,
           elapsedSeconds,
           webhookElapsed,
+          rapidPolling: conversation.rapidPollingStarted, // NEW: Tell frontend to poll faster
           completed: false,
         })
       }
@@ -275,16 +320,18 @@ export async function POST(request: NextRequest) {
         conversationResponses.delete(userPhone)
       }
 
-      // Start tracking - API will be called at 88 seconds
+      // Start tracking - API will be called at 3 seconds
       activeConversations.set(userPhone, {
         startTime: Date.now(),
         lastEmptyMessageTime: Date.now(),
-        lastPollTime: Date.now(), // NEW: Initialize poll time
+        lastPollTime: Date.now(),
         completed: false,
         userMessage: userMessage,
         webhookCalled: false,
         emptyMessageCount: 0,
         processingStarted: false,
+        webhookCompleted: false,
+        rapidPollingStarted: false, // NEW
       })
 
       console.log(`[send] Conversation started. API will be called at ${API_CALL_TIME}s`)
@@ -292,7 +339,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({
         ok: true,
         status: "pending",
-        message: "Response received. Processing...",
+        message: "Response received. Starting analysis...",
         requestId,
         pending: true,
         isSoftSkillsResponse: true,
@@ -312,22 +359,24 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Background processing - called once at 88 seconds
+// Background processing - called once at 3 seconds
 async function processWebhookInBackground(userPhone: string, userMessage: string, requestId: string) {
   const startTime = Date.now()
   console.log(`[background] 🚀 Starting API call for ${userPhone}`)
 
   try {
-    // Call with generous timeout (2 minutes for n8n processing)
-    const result = await sendToWebhook(userPhone, userMessage, requestId, 120000)
+    // Call with timeout matching n8n workflow time (90 seconds)
+    const result = await sendToWebhook(userPhone, userMessage, requestId, WEBHOOK_TIMEOUT)
 
     const duration = Math.floor((Date.now() - startTime) / 1000)
+    console.log(`[background] Webhook completed in ${duration}s`)
 
     if (result.ok) {
       console.log(`[background] ✅ API SUCCESS in ${duration}s`)
+      console.log(`[background] Response: ${result.message.substring(0, 200)}...`)
 
       conversationResponses.set(userPhone, {
-        message: result.message || "Response received",
+        message: result.message || "Analysis complete! Here's your soft skills assessment.",
         timestamp: Date.now(),
         success: true,
       })
@@ -335,7 +384,7 @@ async function processWebhookInBackground(userPhone: string, userMessage: string
       console.error(`[background] ❌ API FAILED in ${duration}s:`, result.message)
 
       conversationResponses.set(userPhone, {
-        message: "I'm processing your information. Please wait a moment and try again.",
+        message: "I encountered an issue processing your response. Please try again in a moment.",
         timestamp: Date.now(),
         success: false,
       })
@@ -345,10 +394,10 @@ async function processWebhookInBackground(userPhone: string, userMessage: string
     const conversation = activeConversations.get(userPhone)
     if (conversation) {
       conversation.completed = true
+      conversation.webhookCompleted = true
       activeConversations.set(userPhone, conversation)
-      console.log(
-        `[background] Marked as completed (total time: ${Math.floor((Date.now() - conversation.startTime) / 1000)}s)`,
-      )
+      const totalTime = Math.floor((Date.now() - conversation.startTime) / 1000)
+      console.log(`[background] Marked as completed (total time: ${totalTime}s)`)
     }
   } catch (error) {
     const duration = Math.floor((Date.now() - startTime) / 1000)
@@ -363,18 +412,20 @@ async function processWebhookInBackground(userPhone: string, userMessage: string
     const conversation = activeConversations.get(userPhone)
     if (conversation) {
       conversation.completed = true
+      conversation.webhookCompleted = true
       activeConversations.set(userPhone, conversation)
     }
   }
 }
 
-// Send to webhook (keep this function the same as before)
+// Send to webhook - keep existing implementation
 async function sendToWebhook(
   userPhone: string,
   userMessage: string,
   requestId: string,
-  timeoutMs = 25000,
+  timeoutMs = 90000,
 ): Promise<{ ok: boolean; message: string }> {
+  // ... keep existing sendToWebhook implementation
   const webhookPayload = {
     specversion: "1.0",
     type: "com.twilio.messaging.inbound-message.received",
@@ -405,6 +456,7 @@ async function sendToWebhook(
 
   const maxAttemptsPerEndpoint = 2
   let lastDetail = "Unable to reach the service"
+  let lastResponse: any = null
 
   for (const url of endpoints) {
     for (let attempt = 1; attempt <= maxAttemptsPerEndpoint; attempt++) {
@@ -431,39 +483,64 @@ async function sendToWebhook(
         const duration = Date.now() - callStart
 
         const contentType = response.headers.get("content-type") || ""
-        const getBody = async () => {
-          if (contentType.includes("application/json")) {
-            try {
-              return await response.json()
-            } catch {
-              return { raw: await response.text() }
-            }
+        
+        let body: any
+        if (contentType.includes("application/json")) {
+          try {
+            body = await response.json()
+            lastResponse = body
+            console.log(`[webhook] JSON response received in ${duration}ms`)
+          } catch (e) {
+            const rawText = await response.text()
+            body = { raw: rawText }
+            lastResponse = rawText
+            console.log(`[webhook] Text response received in ${duration}ms`)
           }
-          return { raw: await response.text() }
+        } else {
+          const rawText = await response.text()
+          body = { raw: rawText }
+          lastResponse = rawText
+          console.log(`[webhook] Non-JSON response received in ${duration}ms`)
         }
 
-        const body = await getBody()
-
         if (response.ok) {
-          const message =
-            (body && typeof body === "object" && "output" in body && (body as any).output) ||
-            (body && typeof body === "object" && "message" in body && (body as any).message) ||
-            (typeof body === "string" ? body : JSON.stringify(body))
+          let message = "Analysis complete! Here's your soft skills assessment."
+          
+          if (body && typeof body === "object") {
+            message = 
+              body.output ||
+              body.message ||
+              body.response ||
+              body.result ||
+              (body.data && (body.data.output || body.data.message)) ||
+              JSON.stringify(body)
+          } else if (typeof body === "string") {
+            message = body
+          }
+
+          if (message.length > 2000) {
+            message = message.substring(0, 2000) + "..."
+          }
 
           console.log(`[webhook] ✅ SUCCESS in ${duration}ms`)
+          console.log(`[webhook] Final message: ${message.substring(0, 100)}...`)
           return { ok: true, message }
         } else {
           lastDetail = `Status ${response.status}`
-          console.log(`[webhook] ❌ FAILED in ${duration}ms: ${lastDetail}`)
+          console.log(`[webhook] ❌ FAILED in ${duration}ms: ${lastDetail}`, body)
         }
       } catch (err) {
         const isTimeout = err instanceof Error && (err.name === "AbortError" || err.message.includes("aborted"))
         lastDetail = isTimeout ? "Request timeout" : err instanceof Error ? err.message : String(err)
         console.log(`[webhook] ⚠️ ERROR ${isTimeout ? "(TIMEOUT)" : ""}: ${lastDetail}`)
+        
+        if (isTimeout) {
+          break
+        }
       }
 
       if (attempt < maxAttemptsPerEndpoint) {
-        const backoff = 1000
+        const backoff = 2000
         console.log(`[webhook] Waiting ${backoff}ms before retry...`)
         await new Promise((r) => setTimeout(r, backoff))
       }
@@ -472,6 +549,6 @@ async function sendToWebhook(
 
   return {
     ok: false,
-    message: `Unable to reach webhook after ${maxAttemptsPerEndpoint * endpoints.length} attempts. Last error: ${lastDetail}`,
+    message: "I'm having trouble processing your request right now. Please try again in a moment.",
   }
 }

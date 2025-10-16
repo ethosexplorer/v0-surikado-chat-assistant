@@ -24,12 +24,14 @@ export default function SurikadoChat() {
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const [isPolling, setIsPolling] = useState(false)
-  const [isApiProcessing, setIsApiProcessing] = useState(false)
-  const [pollAttempts, setPollAttempts] = useState(0) // NEW: Track poll attempts
-  const MAX_POLL_ATTEMPTS = 60 // NEW: Max 60 attempts (3 minutes at 3s intervals)
+  const [pollAttempts, setPollAttempts] = useState(0)
+  const [currentPollInterval, setCurrentPollInterval] = useState(3000) // Start with 3 seconds
+  const [isRapidPolling, setIsRapidPolling] = useState(false)
 
-  const POLL_INTERVAL_WAITING = 3000 // Poll every 3 seconds while waiting
-  const POLL_INTERVAL_PROCESSING = 5000 // Poll every 5 seconds when API is processing
+  const MAX_POLL_ATTEMPTS = 90 // Increased for rapid polling (90 seconds total)
+
+  const POLL_INTERVAL_NORMAL = 3000 // 3 seconds
+  const POLL_INTERVAL_RAPID = 1000 // 1 second for rapid polling
 
   const shouldDelayForSoftSkills = (msgs: Message[]) => {
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -67,12 +69,29 @@ export default function SurikadoChat() {
     }
     setIsPolling(false)
     setIsLoading(false)
-    setIsApiProcessing(false)
-    setPollAttempts(0) // NEW: Reset attempts
+    setIsRapidPolling(false)
+    setPollAttempts(0)
+    setCurrentPollInterval(POLL_INTERVAL_NORMAL)
+  }
+
+  const startRapidPolling = () => {
+    if (!isRapidPolling) {
+      console.log("[polling] 🚀 SWITCHING TO RAPID POLLING (1 second intervals)")
+      setIsRapidPolling(true)
+      setCurrentPollInterval(POLL_INTERVAL_RAPID)
+      
+      // Restart the interval with new timing
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current)
+      }
+      pollingIntervalRef.current = setInterval(() => {
+        pollForResponse()
+      }, POLL_INTERVAL_RAPID)
+    }
   }
 
   const pollForResponse = async () => {
-    // NEW: Check max attempts
+    // Check max attempts
     if (pollAttempts >= MAX_POLL_ATTEMPTS) {
       console.error("[polling] Max poll attempts reached")
       stopPolling()
@@ -81,17 +100,17 @@ export default function SurikadoChat() {
         {
           id: `${Date.now()}`,
           type: "system",
-          content: "Request timed out. Please try again.",
+          content: "This is taking longer than expected. Your request is still processing and you'll get a response soon.",
           timestamp: new Date(),
         },
       ])
       return
     }
 
-    setPollAttempts(prev => prev + 1) // NEW: Increment attempts
+    setPollAttempts(prev => prev + 1)
 
     try {
-      console.log(`[polling] Checking for response... (attempt ${pollAttempts + 1}/${MAX_POLL_ATTEMPTS})`)
+      console.log(`[polling] Checking for response... (attempt ${pollAttempts}/${MAX_POLL_ATTEMPTS}, interval: ${currentPollInterval}ms)`)
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -104,6 +123,11 @@ export default function SurikadoChat() {
       const result = await response.json()
       console.log("[polling] Poll result:", result)
 
+      // NEW: Check if backend suggests rapid polling
+      if (result.rapidPolling && !isRapidPolling) {
+        startRapidPolling()
+      }
+
       if (!response.ok) {
         stopPolling()
         setMessages((prev) => [
@@ -111,14 +135,14 @@ export default function SurikadoChat() {
           {
             id: `${Date.now()}`,
             type: "system",
-            content: result?.message || "Polling failed",
+            content: result?.message || "Connection issue. Please try again.",
             timestamp: new Date(),
           },
         ])
         return
       }
 
-      // NEW: Handle timeout status from backend
+      // Handle timeout status from backend
       if (result.status === "timeout") {
         console.log("[polling] Backend reported polling timeout")
         stopPolling()
@@ -136,12 +160,9 @@ export default function SurikadoChat() {
 
       // Handle different polling states
       if (result.status === "empty") {
-        // Backend sent an empty message - update or add typing indicator
         console.log("[polling] Empty message received:", result.message)
         setMessages((prev) => {
-          // Remove old typing messages
           const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-          // Add new typing message with the content from backend
           return [
             ...withoutTyping,
             {
@@ -153,18 +174,13 @@ export default function SurikadoChat() {
           ]
         })
       } else if (result.status === "processing") {
-        // Backend is processing the webhook call
-        console.log("[polling] Processing webhook...")
-        setIsApiProcessing(true)
+        console.log("[polling] Processing webhook...", result.webhookElapsed)
         
-        // NEW: Switch to longer interval when API is processing
-        if (pollingIntervalRef.current) {
-          clearInterval(pollingIntervalRef.current)
-          pollingIntervalRef.current = setInterval(() => {
-            pollForResponse()
-          }, POLL_INTERVAL_PROCESSING)
+        // NEW: Auto-switch to rapid polling if processing for more than 65 seconds
+        if (result.webhookElapsed > 65 && !isRapidPolling) {
+          startRapidPolling()
         }
-
+        
         setMessages((prev) => {
           const withoutTyping = prev.filter((msg) => msg.type !== "typing")
           return [
@@ -178,7 +194,6 @@ export default function SurikadoChat() {
           ]
         })
       } else if (result.status === "completed") {
-        // Final response received
         console.log("[polling] Completed! Final message:", result.message)
         stopPolling()
         setMessages((prev) => [
@@ -191,27 +206,21 @@ export default function SurikadoChat() {
           },
         ])
       } else if (result.status === "waiting") {
-        // Still processing, keep polling
         console.log("[polling] Still waiting...", result.elapsedSeconds)
+        
+        // NEW: Auto-switch to rapid polling if elapsed time > 70 seconds
+        if (result.elapsedSeconds > 70 && !isRapidPolling) {
+          startRapidPolling()
+        }
       } else if (result.status === "none") {
-        // No active conversation found
         console.log("[polling] No active conversation")
         stopPolling()
       }
     } catch (error) {
       console.error("[polling] Error:", error)
-      // NEW: Don't stop polling immediately on network errors, retry
-      if (pollAttempts >= MAX_POLL_ATTEMPTS) {
-        stopPolling()
-        setMessages((prev) => [
-          ...prev.filter((msg) => msg.type !== "typing"),
-          {
-            id: `${Date.now()}`,
-            type: "system",
-            content: "Network error. Please try again.",
-            timestamp: new Date(),
-          },
-        ])
+      // Don't stop polling immediately on network errors
+      if (pollAttempts >= MAX_POLL_ATTEMPTS - 10) {
+        console.log("[polling] Final attempts, continuing...")
       }
     }
   }
@@ -220,8 +229,9 @@ export default function SurikadoChat() {
     console.log("[polling] Starting polling...")
     setIsPolling(true)
     setIsLoading(true)
-    setIsApiProcessing(false)
-    setPollAttempts(0) // NEW: Reset attempts
+    setIsRapidPolling(false)
+    setPollAttempts(0)
+    setCurrentPollInterval(POLL_INTERVAL_NORMAL)
 
     // Add initial typing indicator
     setMessages((prev) => [
@@ -229,7 +239,7 @@ export default function SurikadoChat() {
       {
         id: `typing-${Date.now()}`,
         type: "typing",
-        content: "Processing your response...",
+        content: "Starting analysis of your soft skills...",
         timestamp: new Date(),
       },
     ])
@@ -237,10 +247,10 @@ export default function SurikadoChat() {
     // Start polling immediately
     pollForResponse()
 
-    // Poll every 3 seconds initially (will switch to 5s when API starts processing)
+    // Start with normal polling interval
     pollingIntervalRef.current = setInterval(() => {
       pollForResponse()
-    }, POLL_INTERVAL_WAITING)
+    }, POLL_INTERVAL_NORMAL)
   }
 
   // Cleanup on unmount
@@ -276,7 +286,7 @@ export default function SurikadoChat() {
           action: "send",
           message: messageToSend,
           toPhone: normalizeWhatsApp(toPhone),
-          isSoftSkillsQuestion: isSoftSkills, // Tell backend this needs special handling
+          isSoftSkillsQuestion: isSoftSkills,
         }),
       })
 
@@ -284,12 +294,9 @@ export default function SurikadoChat() {
       console.log("[send] API response:", result)
 
       if (response.ok && result.isSoftSkillsResponse) {
-        // Backend confirmed this is a soft skills response
-        // Start polling for empty messages and final response
         console.log("[send] Soft skills response detected, starting polling")
         startPolling()
       } else if (response.ok) {
-        // Normal response received immediately
         setIsLoading(false)
         const systemMessage: Message = {
           id: `${Date.now()}`,
@@ -299,7 +306,6 @@ export default function SurikadoChat() {
         }
         setMessages((prev) => [...prev, systemMessage])
       } else {
-        // Error occurred
         setIsLoading(false)
         const errorMessage: Message = {
           id: `${Date.now()}`,
