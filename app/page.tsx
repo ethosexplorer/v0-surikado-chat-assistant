@@ -25,32 +25,30 @@ export default function SurikadoChat() {
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const [isPolling, setIsPolling] = useState(false)
   const [pollAttempts, setPollAttempts] = useState(0)
-  const [currentPollInterval, setCurrentPollInterval] = useState(3000) // Start with 3 seconds
+  const [currentPollInterval, setCurrentPollInterval] = useState(3000)
   const [isRapidPolling, setIsRapidPolling] = useState(false)
+  const [waitingForApiCall, setWaitingForApiCall] = useState(false)
+  const [secondsUntilApiCall, setSecondsUntilApiCall] = useState(0)
 
-  const MAX_POLL_ATTEMPTS = 90 // Increased for rapid polling (90 seconds total)
+  const MAX_POLL_ATTEMPTS = 200 // Increased for longer soft skills wait
 
-  const POLL_INTERVAL_NORMAL = 3000 // 3 seconds
-  const POLL_INTERVAL_RAPID = 1000 // 1 second for rapid polling
+  const POLL_INTERVAL_NORMAL = 3000
+  const POLL_INTERVAL_RAPID = 1000
 
   const shouldDelayForSoftSkills = (msgs: Message[]) => {
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]
-      if (m.type !== "user") {
-        const t = (m.content || "").toLowerCase()
-        if (
-          /soft\s*skills?/.test(t) ||
-          /your\s+soft\s+skills?/.test(t) ||
-          /list.*soft\s*skills?/.test(t) ||
-          /what\s+soft\s+skills\s+do\s+you\s+excel\s+at/.test(t) ||
-          (/teamwork/.test(t) && /problem-?solving/.test(t))
-        ) {
-          return true
-        }
-        return false
-      }
-    }
-    return false
+    const userMessage = msgs[msgs.length - 1]?.content || ""
+    const message = userMessage.toLowerCase()
+    
+    // Check for soft skills related keywords
+    const softSkillsKeywords = [
+      'soft skills', 'softskills', 'teamwork', 'communication', 
+      'leadership', 'problem solving', 'problemsolving', 'collaboration',
+      'adaptability', 'time management', 'creativity', 'critical thinking',
+      'what soft skills', 'list soft skills', 'my soft skills',
+      'strengths', 'weaknesses', 'abilities', 'personal skills'
+    ]
+    
+    return softSkillsKeywords.some(keyword => message.includes(keyword))
   }
 
   const normalizeWhatsApp = (raw: string) => {
@@ -70,6 +68,8 @@ export default function SurikadoChat() {
     setIsPolling(false)
     setIsLoading(false)
     setIsRapidPolling(false)
+    setWaitingForApiCall(false)
+    setSecondsUntilApiCall(0)
     setPollAttempts(0)
     setCurrentPollInterval(POLL_INTERVAL_NORMAL)
   }
@@ -80,7 +80,6 @@ export default function SurikadoChat() {
       setIsRapidPolling(true)
       setCurrentPollInterval(POLL_INTERVAL_RAPID)
       
-      // Restart the interval with new timing
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current)
       }
@@ -91,7 +90,6 @@ export default function SurikadoChat() {
   }
 
   const pollForResponse = async () => {
-    // Check max attempts
     if (pollAttempts >= MAX_POLL_ATTEMPTS) {
       console.error("[polling] Max poll attempts reached")
       stopPolling()
@@ -123,9 +121,24 @@ export default function SurikadoChat() {
       const result = await response.json()
       console.log("[polling] Poll result:", result)
 
-      // NEW: Check if backend suggests rapid polling
+      // Handle rapid polling for soft skills
       if (result.rapidPolling && !isRapidPolling) {
         startRapidPolling()
+      }
+
+      // Handle waiting for API call (soft skills flow)
+      if (result.waitingForApiCall) {
+        setWaitingForApiCall(true)
+        setSecondsUntilApiCall(result.secondsUntilApiCall || 0)
+        console.log(`[polling] Waiting for API call in ${result.secondsUntilApiCall}s`)
+        
+        // Start rapid polling when we're close to API call time
+        if (result.secondsUntilApiCall <= 5 && !isRapidPolling) {
+          startRapidPolling()
+        }
+      } else {
+        setWaitingForApiCall(false)
+        setSecondsUntilApiCall(0)
       }
 
       if (!response.ok) {
@@ -142,7 +155,6 @@ export default function SurikadoChat() {
         return
       }
 
-      // Handle timeout status from backend
       if (result.status === "timeout") {
         console.log("[polling] Backend reported polling timeout")
         stopPolling()
@@ -158,7 +170,6 @@ export default function SurikadoChat() {
         return
       }
 
-      // Handle different polling states
       if (result.status === "empty") {
         console.log("[polling] Empty message received:", result.message)
         setMessages((prev) => {
@@ -176,7 +187,6 @@ export default function SurikadoChat() {
       } else if (result.status === "processing") {
         console.log("[polling] Processing webhook...", result.webhookElapsed)
         
-        // NEW: Auto-switch to rapid polling if processing for more than 65 seconds
         if (result.webhookElapsed > 65 && !isRapidPolling) {
           startRapidPolling()
         }
@@ -208,52 +218,63 @@ export default function SurikadoChat() {
       } else if (result.status === "waiting") {
         console.log("[polling] Still waiting...", result.elapsedSeconds)
         
-        // NEW: Auto-switch to rapid polling if elapsed time > 70 seconds
-        if (result.elapsedSeconds > 70 && !isRapidPolling) {
+        if (result.elapsedSeconds > 65 && !isRapidPolling) {
           startRapidPolling()
         }
+
+        setMessages((prev) => {
+          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
+          return [
+            ...withoutTyping,
+            {
+              id: `typing-${Date.now()}`,
+              type: "typing",
+              content: result.message,
+              timestamp: new Date(),
+            },
+          ]
+        })
       } else if (result.status === "none") {
         console.log("[polling] No active conversation")
         stopPolling()
       }
     } catch (error) {
       console.error("[polling] Error:", error)
-      // Don't stop polling immediately on network errors
       if (pollAttempts >= MAX_POLL_ATTEMPTS - 10) {
         console.log("[polling] Final attempts, continuing...")
       }
     }
   }
 
-  const startPolling = () => {
-    console.log("[polling] Starting polling...")
+  const startPolling = (isSoftSkills = false) => {
+    console.log(`[polling] Starting polling for ${isSoftSkills ? 'soft skills' : 'normal'} flow`)
     setIsPolling(true)
     setIsLoading(true)
     setIsRapidPolling(false)
     setPollAttempts(0)
     setCurrentPollInterval(POLL_INTERVAL_NORMAL)
 
-    // Add initial typing indicator
+    const initialMessage = isSoftSkills 
+      ? "Starting soft skills analysis... (This may take about 1-2 minutes)" 
+      : "Processing your request..."
+
     setMessages((prev) => [
       ...prev,
       {
         id: `typing-${Date.now()}`,
         type: "typing",
-        content: "Starting analysis of your soft skills...",
+        content: initialMessage,
         timestamp: new Date(),
       },
     ])
 
-    // Start polling immediately
     pollForResponse()
 
-    // Start with normal polling interval
     pollingIntervalRef.current = setInterval(() => {
       pollForResponse()
     }, POLL_INTERVAL_NORMAL)
   }
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       stopPolling()
@@ -275,8 +296,7 @@ export default function SurikadoChat() {
     setInputMessage("")
     setIsLoading(true)
 
-    // Check if this is a response to a soft skills question
-    const isSoftSkills = shouldDelayForSoftSkills(messages)
+    const isSoftSkills = shouldDelayForSoftSkills([...messages, userMessage])
 
     try {
       const response = await fetch("/api/send-message", {
@@ -294,8 +314,8 @@ export default function SurikadoChat() {
       console.log("[send] API response:", result)
 
       if (response.ok && result.isSoftSkillsResponse) {
-        console.log("[send] Soft skills response detected, starting polling")
-        startPolling()
+        console.log("[send] Starting soft skills polling flow")
+        startPolling(true)
       } else if (response.ok) {
         setIsLoading(false)
         const systemMessage: Message = {
@@ -328,7 +348,6 @@ export default function SurikadoChat() {
     }
   }
 
-  // ... rest of your existing functions (handleParseJSON, handleClearCache) remain the same
   const handleParseJSON = async () => {
     console.log("[v0] Parse JSON button clicked")
     console.log("[v0] Messages length:", messages.length)
@@ -469,6 +488,22 @@ export default function SurikadoChat() {
       <div className="max-w-4xl mx-auto p-4 h-[calc(100vh-80px)]">
         <Card className="h-full p-4 shadow-lg">
           <div className="h-full flex flex-col">
+            {/* Status indicator for soft skills waiting */}
+            {waitingForApiCall && secondsUntilApiCall > 0 && (
+              <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                <div className="flex items-center justify-between">
+                  <span className="text-blue-700 text-sm">
+                    ⏳ Soft skills analysis starting in {secondsUntilApiCall} seconds...
+                  </span>
+                  <div className="flex gap-1">
+                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
+                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.1s" }}></div>
+                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.2s" }}></div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="flex-1 overflow-y-auto space-y-4 mb-4">
               {messages.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-full text-center">
@@ -477,6 +512,7 @@ export default function SurikadoChat() {
                   </div>
                   <h2 className="text-xl font-semibold text-gray-800 mb-2">Welcome to Surikado!</h2>
                   <p className="text-gray-600">Start a conversation to find amazing job opportunities.</p>
+                  <p className="text-gray-500 text-sm mt-2">Ask about soft skills for detailed analysis</p>
                 </div>
               ) : (
                 messages.map((message) => (

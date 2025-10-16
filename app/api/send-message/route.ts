@@ -18,7 +18,8 @@ const activeConversations = new Map<
     processingStarted: boolean
     lastPollTime: number
     webhookCompleted: boolean
-    rapidPollingStarted: boolean // NEW: Track rapid polling state
+    rapidPollingStarted: boolean
+    isSoftSkillsFlow: boolean // Track if this is a soft skills question
   }
 >()
 
@@ -32,10 +33,10 @@ const conversationResponses = new Map<
   }
 >()
 
-// TIMING CONFIGURATION - OPTIMIZED FOR RAPID POLLING
+// TIMING CONFIGURATION
 const EMPTY_MESSAGE_INTERVAL = 8000 // Send empty message every 8 seconds
-const API_CALL_TIME = 3 // Call n8n API after 3 seconds
-const RAPID_POLLING_START_TIME = 70 // Start rapid polling after 70 seconds (1:10 mins)
+const SOFT_SKILLS_API_DELAY = 70 // Call API after 70 seconds (1:10 mins) for soft skills
+const SOFT_SKILLS_RAPID_POLL_START = 65 // Start rapid polling at 65 seconds
 const MAX_TOTAL_TIME = 120 // Absolute max 2 minutes
 const POLL_TIMEOUT = 45000 // 45 seconds poll timeout
 const WEBHOOK_TIMEOUT = 90000 // 90 seconds for webhook to complete
@@ -82,6 +83,19 @@ const getEmptyMessage = (count: number): string => {
   return messages[index]
 }
 
+// Generate soft skills waiting messages
+const getSoftSkillsWaitingMessage = (elapsedSeconds: number): string => {
+  if (elapsedSeconds < 20) {
+    return "🔄 Preparing soft skills analysis..."
+  } else if (elapsedSeconds < 40) {
+    return "💭 Setting up your assessment..."
+  } else if (elapsedSeconds < 60) {
+    return "📊 Getting your profile ready..."
+  } else {
+    return "⚡ Almost ready to process..."
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const data = await request.json()
@@ -105,7 +119,7 @@ export async function POST(request: NextRequest) {
 
     const requestId = `${userPhone}-${Date.now()}`
 
-    console.log(`[${new Date().toISOString()}] Action: ${action}, Phone: ${userPhone}`)
+    console.log(`[${new Date().toISOString()}] Action: ${action}, Phone: ${userPhone}, SoftSkills: ${isSoftSkillsQuestion}`)
 
     // POLLING MODE: Check for empty messages or final response
     if (action === "poll") {
@@ -140,11 +154,11 @@ export async function POST(request: NextRequest) {
         : 0
 
       console.log(
-        `[poll] Elapsed: ${elapsedSeconds}s, Processing: ${totalProcessingTime}s, WebhookCalled: ${conversation.webhookCalled}, RapidPolling: ${conversation.rapidPollingStarted}`,
+        `[poll] Elapsed: ${elapsedSeconds}s, Processing: ${totalProcessingTime}s, WebhookCalled: ${conversation.webhookCalled}, RapidPolling: ${conversation.rapidPollingStarted}, IsSoftSkills: ${conversation.isSoftSkillsFlow}`,
       )
 
-      // NEW: Check if we should start rapid polling (after 70 seconds)
-      if (elapsedSeconds >= RAPID_POLLING_START_TIME && !conversation.rapidPollingStarted) {
+      // Check if we should start rapid polling (after 65 seconds for soft skills)
+      if (elapsedSeconds >= SOFT_SKILLS_RAPID_POLL_START && !conversation.rapidPollingStarted && conversation.isSoftSkillsFlow) {
         conversation.rapidPollingStarted = true
         activeConversations.set(userPhone, conversation)
         console.log(`[poll] 🚀 STARTING RAPID POLLING at ${elapsedSeconds}s`)
@@ -224,16 +238,17 @@ export async function POST(request: NextRequest) {
         }
       }
 
-      // Check if it's time to call the API (at 3 seconds)
-      if (elapsedSeconds >= API_CALL_TIME && !conversation.webhookCalled) {
-        console.log(`[poll] ⏰ Reached ${API_CALL_TIME}s - CALLING API NOW`)
+      // Check if it's time to call the API (at 70 seconds for soft skills)
+      if (elapsedSeconds >= SOFT_SKILLS_API_DELAY && !conversation.webhookCalled && conversation.isSoftSkillsFlow) {
+        console.log(`[poll] ⏰ SOFT SKILLS: Reached ${SOFT_SKILLS_API_DELAY}s - CALLING API NOW`)
 
         conversation.webhookCalled = true
         conversation.webhookStartTime = Date.now()
         conversation.processingStarted = true
+        conversation.rapidPollingStarted = true // Start rapid polling immediately
         activeConversations.set(userPhone, conversation)
 
-        // Call API in background (don't await - let it run)
+        // Call API in background
         processWebhookInBackground(userPhone, conversation.userMessage, requestId)
 
         // Return processing status
@@ -241,6 +256,22 @@ export async function POST(request: NextRequest) {
           status: "processing",
           message: "⚡ Starting to process your soft skills...",
           elapsedSeconds,
+          rapidPolling: true, // Tell frontend to poll every 1 second
+          completed: false,
+        })
+      }
+
+      // Before API call time for soft skills - show waiting messages
+      if (!conversation.webhookCalled && conversation.isSoftSkillsFlow) {
+        const secondsUntilApiCall = Math.max(0, SOFT_SKILLS_API_DELAY - elapsedSeconds)
+        
+        return NextResponse.json({
+          status: "waiting",
+          message: getSoftSkillsWaitingMessage(elapsedSeconds),
+          elapsedSeconds,
+          waitingForApiCall: true,
+          secondsUntilApiCall: secondsUntilApiCall,
+          rapidPolling: conversation.rapidPollingStarted,
           completed: false,
         })
       }
@@ -270,12 +301,12 @@ export async function POST(request: NextRequest) {
           message: processingMessage,
           elapsedSeconds,
           webhookElapsed,
-          rapidPolling: conversation.rapidPollingStarted, // NEW: Tell frontend to poll faster
+          rapidPolling: conversation.rapidPollingStarted,
           completed: false,
         })
       }
 
-      // Before API call time - send empty messages
+      // For non-soft skills flows - send empty messages
       const timeSinceLastEmpty = Date.now() - conversation.lastEmptyMessageTime
       if (timeSinceLastEmpty >= EMPTY_MESSAGE_INTERVAL) {
         conversation.lastEmptyMessageTime = Date.now()
@@ -308,9 +339,9 @@ export async function POST(request: NextRequest) {
 
     console.log(`[send] Message:`, userMessage.substring(0, 50))
 
-    // If this is a user response to a soft skills question
+    // Handle soft skills questions (initial flow with 70-second delay)
     if (isSoftSkillsQuestion) {
-      console.log(`[send] Starting soft skills response flow`)
+      console.log(`[send] Starting SOFT SKILLS flow with ${SOFT_SKILLS_API_DELAY}s delay`)
 
       // Clean up any existing conversation
       const existing = activeConversations.get(userPhone)
@@ -320,7 +351,7 @@ export async function POST(request: NextRequest) {
         conversationResponses.delete(userPhone)
       }
 
-      // Start tracking - API will be called at 3 seconds
+      // Start tracking - API will be called at 70 seconds
       activeConversations.set(userPhone, {
         startTime: Date.now(),
         lastEmptyMessageTime: Date.now(),
@@ -331,18 +362,20 @@ export async function POST(request: NextRequest) {
         emptyMessageCount: 0,
         processingStarted: false,
         webhookCompleted: false,
-        rapidPollingStarted: false, // NEW
+        rapidPollingStarted: false,
+        isSoftSkillsFlow: true, // Mark as soft skills flow
       })
 
-      console.log(`[send] Conversation started. API will be called at ${API_CALL_TIME}s`)
+      console.log(`[send] Soft skills conversation started. API will be called at ${SOFT_SKILLS_API_DELAY}s (1:10 mins)`)
 
       return NextResponse.json({
         ok: true,
         status: "pending",
-        message: "Response received. Starting analysis...",
+        message: "Response received. Starting soft skills analysis...",
         requestId,
         pending: true,
         isSoftSkillsResponse: true,
+        waitTime: SOFT_SKILLS_API_DELAY, // Tell frontend how long to wait
       })
     } else {
       // For normal messages, call webhook immediately
@@ -359,7 +392,7 @@ export async function POST(request: NextRequest) {
   }
 }
 
-// Background processing - called once at 3 seconds
+// Background processing - called once at 70 seconds for soft skills
 async function processWebhookInBackground(userPhone: string, userMessage: string, requestId: string) {
   const startTime = Date.now()
   console.log(`[background] 🚀 Starting API call for ${userPhone}`)
@@ -418,14 +451,13 @@ async function processWebhookInBackground(userPhone: string, userMessage: string
   }
 }
 
-// Send to webhook - keep existing implementation
+// Send to webhook
 async function sendToWebhook(
   userPhone: string,
   userMessage: string,
   requestId: string,
   timeoutMs = 90000,
 ): Promise<{ ok: boolean; message: string }> {
-  // ... keep existing sendToWebhook implementation
   const webhookPayload = {
     specversion: "1.0",
     type: "com.twilio.messaging.inbound-message.received",
