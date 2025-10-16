@@ -34,12 +34,13 @@ const conversationResponses = new Map<
 >()
 
 // TIMING CONFIGURATION
+// TIMING CONFIGURATION - Updated to match your n8n workflow
 const EMPTY_MESSAGE_INTERVAL = 8000 // Send empty message every 8 seconds
-const SOFT_SKILLS_API_DELAY = 70 // Call API after 70 seconds (1:10 mins) for soft skills
-const SOFT_SKILLS_RAPID_POLL_START = 65 // Start rapid polling at 65 seconds
-const MAX_TOTAL_TIME = 120 // Absolute max 2 minutes
+const SOFT_SKILLS_API_DELAY = 5 // Call API after 5 seconds for soft skills (reduced from 70)
+const SOFT_SKILLS_RAPID_POLL_START = 60 // Start rapid polling at 60 seconds
+const MAX_TOTAL_TIME = 90 // Increased to 90 seconds to accommodate 76s workflow
 const POLL_TIMEOUT = 45000 // 45 seconds poll timeout
-const WEBHOOK_TIMEOUT = 90000 // 90 seconds for webhook to complete
+const WEBHOOK_TIMEOUT = 80000 // 80 seconds for webhook to complete (matches n8n time)
 
 // Cleanup old data every minute
 const CLEANUP_INTERVAL = 60000

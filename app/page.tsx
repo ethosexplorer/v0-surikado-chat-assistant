@@ -30,10 +30,9 @@ export default function SurikadoChat() {
   const [waitingForApiCall, setWaitingForApiCall] = useState(false)
   const [secondsUntilApiCall, setSecondsUntilApiCall] = useState(0)
 
-  const MAX_POLL_ATTEMPTS = 200 // Increased for longer soft skills wait
-
-  const POLL_INTERVAL_NORMAL = 3000
-  const POLL_INTERVAL_RAPID = 1000
+  const MAX_POLL_ATTEMPTS = 120 // Increased for longer processing
+const POLL_INTERVAL_NORMAL = 3000
+const POLL_INTERVAL_RAPID = 1000
 
   const shouldDelayForSoftSkills = (msgs: Message[]) => {
     const userMessage = msgs[msgs.length - 1]?.content || ""
@@ -255,8 +254,8 @@ export default function SurikadoChat() {
     setCurrentPollInterval(POLL_INTERVAL_NORMAL)
 
     const initialMessage = isSoftSkills 
-      ? "Starting soft skills analysis... (This may take about 1-2 minutes)" 
-      : "Processing your request..."
+  ? "Starting soft skills analysis... (This may take about 1 minute)" 
+  : "Processing your request..."
 
     setMessages((prev) => [
       ...prev,
