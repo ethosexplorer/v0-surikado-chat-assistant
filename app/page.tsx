@@ -25,6 +25,8 @@ export default function SurikadoChat() {
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const [isPolling, setIsPolling] = useState(false)
   const [isApiProcessing, setIsApiProcessing] = useState(false)
+  const [pollAttempts, setPollAttempts] = useState(0) // NEW: Track poll attempts
+  const MAX_POLL_ATTEMPTS = 60 // NEW: Max 60 attempts (3 minutes at 3s intervals)
 
   const POLL_INTERVAL_WAITING = 3000 // Poll every 3 seconds while waiting
   const POLL_INTERVAL_PROCESSING = 5000 // Poll every 5 seconds when API is processing
@@ -66,11 +68,30 @@ export default function SurikadoChat() {
     setIsPolling(false)
     setIsLoading(false)
     setIsApiProcessing(false)
+    setPollAttempts(0) // NEW: Reset attempts
   }
 
   const pollForResponse = async () => {
+    // NEW: Check max attempts
+    if (pollAttempts >= MAX_POLL_ATTEMPTS) {
+      console.error("[polling] Max poll attempts reached")
+      stopPolling()
+      setMessages((prev) => [
+        ...prev.filter((msg) => msg.type !== "typing"),
+        {
+          id: `${Date.now()}`,
+          type: "system",
+          content: "Request timed out. Please try again.",
+          timestamp: new Date(),
+        },
+      ])
+      return
+    }
+
+    setPollAttempts(prev => prev + 1) // NEW: Increment attempts
+
     try {
-      console.log("[polling] Checking for response...")
+      console.log(`[polling] Checking for response... (attempt ${pollAttempts + 1}/${MAX_POLL_ATTEMPTS})`)
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -91,6 +112,22 @@ export default function SurikadoChat() {
             id: `${Date.now()}`,
             type: "system",
             content: result?.message || "Polling failed",
+            timestamp: new Date(),
+          },
+        ])
+        return
+      }
+
+      // NEW: Handle timeout status from backend
+      if (result.status === "timeout") {
+        console.log("[polling] Backend reported polling timeout")
+        stopPolling()
+        setMessages((prev) => [
+          ...prev.filter((msg) => msg.type !== "typing"),
+          {
+            id: `${Date.now()}`,
+            type: "system",
+            content: result.message || "Session expired. Please send your message again.",
             timestamp: new Date(),
           },
         ])
@@ -118,6 +155,16 @@ export default function SurikadoChat() {
       } else if (result.status === "processing") {
         // Backend is processing the webhook call
         console.log("[polling] Processing webhook...")
+        setIsApiProcessing(true)
+        
+        // NEW: Switch to longer interval when API is processing
+        if (pollingIntervalRef.current) {
+          clearInterval(pollingIntervalRef.current)
+          pollingIntervalRef.current = setInterval(() => {
+            pollForResponse()
+          }, POLL_INTERVAL_PROCESSING)
+        }
+
         setMessages((prev) => {
           const withoutTyping = prev.filter((msg) => msg.type !== "typing")
           return [
@@ -153,16 +200,19 @@ export default function SurikadoChat() {
       }
     } catch (error) {
       console.error("[polling] Error:", error)
-      stopPolling()
-      setMessages((prev) => [
-        ...prev.filter((msg) => msg.type !== "typing"),
-        {
-          id: `${Date.now()}`,
-          type: "system",
-          content: "Error retrieving response",
-          timestamp: new Date(),
-        },
-      ])
+      // NEW: Don't stop polling immediately on network errors, retry
+      if (pollAttempts >= MAX_POLL_ATTEMPTS) {
+        stopPolling()
+        setMessages((prev) => [
+          ...prev.filter((msg) => msg.type !== "typing"),
+          {
+            id: `${Date.now()}`,
+            type: "system",
+            content: "Network error. Please try again.",
+            timestamp: new Date(),
+          },
+        ])
+      }
     }
   }
 
@@ -171,6 +221,7 @@ export default function SurikadoChat() {
     setIsPolling(true)
     setIsLoading(true)
     setIsApiProcessing(false)
+    setPollAttempts(0) // NEW: Reset attempts
 
     // Add initial typing indicator
     setMessages((prev) => [
@@ -271,6 +322,7 @@ export default function SurikadoChat() {
     }
   }
 
+  // ... rest of your existing functions (handleParseJSON, handleClearCache) remain the same
   const handleParseJSON = async () => {
     console.log("[v0] Parse JSON button clicked")
     console.log("[v0] Messages length:", messages.length)

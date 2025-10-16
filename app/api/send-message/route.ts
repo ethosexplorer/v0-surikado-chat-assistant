@@ -16,6 +16,7 @@ const activeConversations = new Map<
     emptyMessageCount: number
     webhookStartTime?: number
     processingStarted: boolean
+    lastPollTime: number // NEW: Track last poll time
   }
 >()
 
@@ -33,6 +34,7 @@ const conversationResponses = new Map<
 const EMPTY_MESSAGE_INTERVAL = 8000 // Send empty message every 8 seconds
 const API_CALL_TIME = 88 // Call n8n API after 88 seconds
 const MAX_TOTAL_TIME = 180 // Absolute max 3 minutes before forcing error
+const POLL_TIMEOUT = 30000 // NEW: 30 seconds poll timeout
 
 // Cleanup old data every minute
 const CLEANUP_INTERVAL = 60000
@@ -124,10 +126,29 @@ export async function POST(request: NextRequest) {
         })
       }
 
+      // NEW: Update last poll time to prevent timeout
+      conversation.lastPollTime = Date.now()
+      activeConversations.set(userPhone, conversation)
+
       const elapsedSeconds = Math.floor((Date.now() - conversation.startTime) / 1000)
       console.log(
         `[poll] Elapsed: ${elapsedSeconds}s, WebhookCalled: ${conversation.webhookCalled}, Completed: ${conversation.completed}`,
       )
+
+      // NEW: Check if polling has timed out (no polls for 30 seconds)
+      const timeSinceLastPoll = Date.now() - conversation.lastPollTime
+      if (timeSinceLastPoll > POLL_TIMEOUT) {
+        console.error(`[poll] POLLING TIMEOUT - No polls for ${timeSinceLastPoll}ms`)
+        activeConversations.delete(userPhone)
+        conversationResponses.delete(userPhone)
+        return NextResponse.json({
+          status: "timeout",
+          message: "Polling session expired. Please send your message again.",
+          elapsedSeconds,
+          completed: true,
+          success: false,
+        })
+      }
 
       // ABSOLUTE TIMEOUT - Force error if taking too long
       if (elapsedSeconds >= MAX_TOTAL_TIME) {
@@ -258,6 +279,7 @@ export async function POST(request: NextRequest) {
       activeConversations.set(userPhone, {
         startTime: Date.now(),
         lastEmptyMessageTime: Date.now(),
+        lastPollTime: Date.now(), // NEW: Initialize poll time
         completed: false,
         userMessage: userMessage,
         webhookCalled: false,
@@ -346,7 +368,7 @@ async function processWebhookInBackground(userPhone: string, userMessage: string
   }
 }
 
-// Send to webhook
+// Send to webhook (keep this function the same as before)
 async function sendToWebhook(
   userPhone: string,
   userMessage: string,
