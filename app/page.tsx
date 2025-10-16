@@ -1,14 +1,14 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import { useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card } from "@/components/ui/card"
-import { MessageCircle, Send, Trash2, FileText } from "lucide-react"
+import { MessageCircle, Send, Trash2, FileText, Clock } from "lucide-react"
 
 interface Message {
   id: string
-  type: "user" | "system" | "api" | "typing"
+  type: "user" | "system" | "api"
   content: string
   timestamp: Date
 }
@@ -21,34 +21,8 @@ export default function SurikadoChat() {
   const [showParsedJSON, setShowParsedJSON] = useState(false)
   const [parsedResume, setParsedResume] = useState<any>(null)
   const [toPhone, setToPhone] = useState("")
-
-  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
-  const [isPolling, setIsPolling] = useState(false)
-  const [pollAttempts, setPollAttempts] = useState(0)
-  const [currentPollInterval, setCurrentPollInterval] = useState(3000)
-  const [isRapidPolling, setIsRapidPolling] = useState(false)
-  const [waitingForApiCall, setWaitingForApiCall] = useState(false)
-  const [secondsUntilApiCall, setSecondsUntilApiCall] = useState(0)
-
-  const MAX_POLL_ATTEMPTS = 120 // Increased for longer processing
-const POLL_INTERVAL_NORMAL = 3000
-const POLL_INTERVAL_RAPID = 1000
-
-  const shouldDelayForSoftSkills = (msgs: Message[]) => {
-    const userMessage = msgs[msgs.length - 1]?.content || ""
-    const message = userMessage.toLowerCase()
-    
-    // Check for soft skills related keywords
-    const softSkillsKeywords = [
-      'soft skills', 'softskills', 'teamwork', 'communication', 
-      'leadership', 'problem solving', 'problemsolving', 'collaboration',
-      'adaptability', 'time management', 'creativity', 'critical thinking',
-      'what soft skills', 'list soft skills', 'my soft skills',
-      'strengths', 'weaknesses', 'abilities', 'personal skills'
-    ]
-    
-    return softSkillsKeywords.some(keyword => message.includes(keyword))
-  }
+  const [isWaiting, setIsWaiting] = useState(false)
+  const [waitTimeRemaining, setWaitTimeRemaining] = useState(0)
 
   const normalizeWhatsApp = (raw: string) => {
     if (!raw) return ""
@@ -59,226 +33,25 @@ const POLL_INTERVAL_RAPID = 1000
     return `whatsapp:${n}`
   }
 
-  const stopPolling = () => {
-    if (pollingIntervalRef.current) {
-      clearInterval(pollingIntervalRef.current)
-      pollingIntervalRef.current = null
-    }
-    setIsPolling(false)
-    setIsLoading(false)
-    setIsRapidPolling(false)
-    setWaitingForApiCall(false)
-    setSecondsUntilApiCall(0)
-    setPollAttempts(0)
-    setCurrentPollInterval(POLL_INTERVAL_NORMAL)
+  const isSoftSkillsMessage = (message: string): boolean => {
+    const softSkillsKeywords = [
+      "soft skill",
+      "communication",
+      "teamwork",
+      "leadership",
+      "problem solving",
+      "time management",
+      "adaptability",
+      "critical thinking",
+      "emotional intelligence",
+      "interpersonal",
+      "collaboration",
+      "creativity",
+      "work ethic",
+    ]
+    const lowerMessage = message.toLowerCase()
+    return softSkillsKeywords.some(keyword => lowerMessage.includes(keyword))
   }
-
-  const startRapidPolling = () => {
-    if (!isRapidPolling) {
-      console.log("[polling] 🚀 SWITCHING TO RAPID POLLING (1 second intervals)")
-      setIsRapidPolling(true)
-      setCurrentPollInterval(POLL_INTERVAL_RAPID)
-      
-      if (pollingIntervalRef.current) {
-        clearInterval(pollingIntervalRef.current)
-      }
-      pollingIntervalRef.current = setInterval(() => {
-        pollForResponse()
-      }, POLL_INTERVAL_RAPID)
-    }
-  }
-
-  const pollForResponse = async () => {
-    if (pollAttempts >= MAX_POLL_ATTEMPTS) {
-      console.error("[polling] Max poll attempts reached")
-      stopPolling()
-      setMessages((prev) => [
-        ...prev.filter((msg) => msg.type !== "typing"),
-        {
-          id: `${Date.now()}`,
-          type: "system",
-          content: "This is taking longer than expected. Your request is still processing and you'll get a response soon.",
-          timestamp: new Date(),
-        },
-      ])
-      return
-    }
-
-    setPollAttempts(prev => prev + 1)
-
-    try {
-      console.log(`[polling] Checking for response... (attempt ${pollAttempts}/${MAX_POLL_ATTEMPTS}, interval: ${currentPollInterval}ms)`)
-      const response = await fetch("/api/send-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "poll",
-          toPhone: normalizeWhatsApp(toPhone),
-        }),
-      })
-
-      const result = await response.json()
-      console.log("[polling] Poll result:", result)
-
-      // Handle rapid polling for soft skills
-      if (result.rapidPolling && !isRapidPolling) {
-        startRapidPolling()
-      }
-
-      // Handle waiting for API call (soft skills flow)
-      if (result.waitingForApiCall) {
-        setWaitingForApiCall(true)
-        setSecondsUntilApiCall(result.secondsUntilApiCall || 0)
-        console.log(`[polling] Waiting for API call in ${result.secondsUntilApiCall}s`)
-        
-        // Start rapid polling when we're close to API call time
-        if (result.secondsUntilApiCall <= 5 && !isRapidPolling) {
-          startRapidPolling()
-        }
-      } else {
-        setWaitingForApiCall(false)
-        setSecondsUntilApiCall(0)
-      }
-
-      if (!response.ok) {
-        stopPolling()
-        setMessages((prev) => [
-          ...prev.filter((msg) => msg.type !== "typing"),
-          {
-            id: `${Date.now()}`,
-            type: "system",
-            content: result?.message || "Connection issue. Please try again.",
-            timestamp: new Date(),
-          },
-        ])
-        return
-      }
-
-      if (result.status === "timeout") {
-        console.log("[polling] Backend reported polling timeout")
-        stopPolling()
-        setMessages((prev) => [
-          ...prev.filter((msg) => msg.type !== "typing"),
-          {
-            id: `${Date.now()}`,
-            type: "system",
-            content: result.message || "Session expired. Please send your message again.",
-            timestamp: new Date(),
-          },
-        ])
-        return
-      }
-
-      if (result.status === "empty") {
-        console.log("[polling] Empty message received:", result.message)
-        setMessages((prev) => {
-          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-          return [
-            ...withoutTyping,
-            {
-              id: `typing-${Date.now()}`,
-              type: "typing",
-              content: result.message,
-              timestamp: new Date(),
-            },
-          ]
-        })
-      } else if (result.status === "processing") {
-        console.log("[polling] Processing webhook...", result.webhookElapsed)
-        
-        if (result.webhookElapsed > 65 && !isRapidPolling) {
-          startRapidPolling()
-        }
-        
-        setMessages((prev) => {
-          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-          return [
-            ...withoutTyping,
-            {
-              id: `typing-${Date.now()}`,
-              type: "typing",
-              content: result.message || "Processing your request...",
-              timestamp: new Date(),
-            },
-          ]
-        })
-      } else if (result.status === "completed") {
-        console.log("[polling] Completed! Final message:", result.message)
-        stopPolling()
-        setMessages((prev) => [
-          ...prev.filter((msg) => msg.type !== "typing"),
-          {
-            id: `${Date.now()}`,
-            type: "api",
-            content: result.message,
-            timestamp: new Date(),
-          },
-        ])
-      } else if (result.status === "waiting") {
-        console.log("[polling] Still waiting...", result.elapsedSeconds)
-        
-        if (result.elapsedSeconds > 65 && !isRapidPolling) {
-          startRapidPolling()
-        }
-
-        setMessages((prev) => {
-          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-          return [
-            ...withoutTyping,
-            {
-              id: `typing-${Date.now()}`,
-              type: "typing",
-              content: result.message,
-              timestamp: new Date(),
-            },
-          ]
-        })
-      } else if (result.status === "none") {
-        console.log("[polling] No active conversation")
-        stopPolling()
-      }
-    } catch (error) {
-      console.error("[polling] Error:", error)
-      if (pollAttempts >= MAX_POLL_ATTEMPTS - 10) {
-        console.log("[polling] Final attempts, continuing...")
-      }
-    }
-  }
-
-  const startPolling = (isSoftSkills = false) => {
-    console.log(`[polling] Starting polling for ${isSoftSkills ? 'soft skills' : 'normal'} flow`)
-    setIsPolling(true)
-    setIsLoading(true)
-    setIsRapidPolling(false)
-    setPollAttempts(0)
-    setCurrentPollInterval(POLL_INTERVAL_NORMAL)
-
-    const initialMessage = isSoftSkills 
-  ? "Starting soft skills analysis... (This may take about 1 minute)" 
-  : "Processing your request..."
-
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `typing-${Date.now()}`,
-        type: "typing",
-        content: initialMessage,
-        timestamp: new Date(),
-      },
-    ])
-
-    pollForResponse()
-
-    pollingIntervalRef.current = setInterval(() => {
-      pollForResponse()
-    }, POLL_INTERVAL_NORMAL)
-  }
-
-  useEffect(() => {
-    return () => {
-      stopPolling()
-    }
-  }, [])
 
   const handleSendMessage = async () => {
     if (!inputMessage.trim()) return
@@ -293,57 +66,134 @@ const POLL_INTERVAL_RAPID = 1000
     setMessages((prev) => [...prev, userMessage])
     const messageToSend = inputMessage
     setInputMessage("")
-    setIsLoading(true)
+    
+    // Check if message is about soft skills
+    const isSoftSkills = isSoftSkillsMessage(messageToSend)
+    
+    if (isSoftSkills) {
+      // Set waiting state and show countdown
+      setIsWaiting(true)
+      const waitTime = 1.20 * 60 * 1000 // 72,000 ms (1.20 minutes)
+      setWaitTimeRemaining(waitTime)
+      
+      const waitMessage: Message = {
+        id: `${Date.now()}-wait`,
+        type: "system",
+        content: `⏳ Processing soft skills analysis... This may take about ${Math.ceil(waitTime / 1000)} seconds.`,
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, waitMessage])
+      
+      // Update countdown every second
+      const interval = setInterval(() => {
+        setWaitTimeRemaining((prev) => {
+          const newTime = prev - 1000
+          if (newTime <= 0) {
+            clearInterval(interval)
+            return 0
+          }
+          return newTime
+        })
+      }, 1000)
+      
+      // Wait for 1.20 minutes, then call the API
+      setTimeout(async () => {
+        clearInterval(interval)
+        setIsWaiting(false)
+        setWaitTimeRemaining(0)
+        setIsLoading(true)
+        
+        try {
+          const response = await fetch("/api/send-message", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "send",
+              message: messageToSend,
+              toPhone: normalizeWhatsApp(toPhone),
+            }),
+          })
 
-    const isSoftSkills = shouldDelayForSoftSkills([...messages, userMessage])
+          const result = await response.json()
+          console.log("[send] API response:", result)
 
-    try {
-      const response = await fetch("/api/send-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "send",
-          message: messageToSend,
-          toPhone: normalizeWhatsApp(toPhone),
-          isSoftSkillsQuestion: isSoftSkills,
-        }),
-      })
-
-      const result = await response.json()
-      console.log("[send] API response:", result)
-
-      if (response.ok && result.isSoftSkillsResponse) {
-        console.log("[send] Starting soft skills polling flow")
-        startPolling(true)
-      } else if (response.ok) {
-        setIsLoading(false)
-        const systemMessage: Message = {
-          id: `${Date.now()}`,
-          type: "api",
-          content: result.message || "Message sent",
-          timestamp: new Date(),
+          if (response.ok) {
+            const apiMessage: Message = {
+              id: `${Date.now()}`,
+              type: "api",
+              content: result.message || "Soft skills analysis completed successfully",
+              timestamp: new Date(),
+            }
+            setMessages((prev) => [...prev, apiMessage])
+          } else {
+            const errorMessage: Message = {
+              id: `${Date.now()}`,
+              type: "system",
+              content: result.error || "Failed to process message",
+              timestamp: new Date(),
+            }
+            setMessages((prev) => [...prev, errorMessage])
+          }
+        } catch (error) {
+          console.error("Error calling API:", error)
+          const errorMessage: Message = {
+            id: Date.now().toString(),
+            type: "system",
+            content: "Network error. Please try again.",
+            timestamp: new Date(),
+          }
+          setMessages((prev) => [...prev, errorMessage])
+        } finally {
+          setIsLoading(false)
         }
-        setMessages((prev) => [...prev, systemMessage])
-      } else {
-        setIsLoading(false)
+      }, waitTime)
+    } else {
+      // For non-soft skills messages, call API immediately
+      setIsLoading(true)
+      
+      try {
+        const response = await fetch("/api/send-message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "send",
+            message: messageToSend,
+            toPhone: normalizeWhatsApp(toPhone),
+          }),
+        })
+
+        const result = await response.json()
+        console.log("[send] API response:", result)
+
+        if (response.ok) {
+          const apiMessage: Message = {
+            id: `${Date.now()}`,
+            type: "api",
+            content: result.message || "Message processed successfully",
+            timestamp: new Date(),
+          }
+          setMessages((prev) => [...prev, apiMessage])
+        } else {
+          const errorMessage: Message = {
+            id: `${Date.now()}`,
+            type: "system",
+            content: result.error || "Failed to process message",
+            timestamp: new Date(),
+          }
+          setMessages((prev) => [...prev, errorMessage])
+        }
+      } catch (error) {
+        console.error("Error calling API:", error)
         const errorMessage: Message = {
-          id: `${Date.now()}`,
+          id: Date.now().toString(),
           type: "system",
-          content: result.error || "Failed to send message",
+          content: "Network error. Please try again.",
           timestamp: new Date(),
         }
         setMessages((prev) => [...prev, errorMessage])
+      } finally {
+        setIsLoading(false)
       }
-    } catch (error) {
-      console.error("Error calling API:", error)
-      setIsLoading(false)
-      const errorMessage: Message = {
-        id: Date.now().toString(),
-        type: "system",
-        content: "Network error. Please try again.",
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, errorMessage])
     }
   }
 
@@ -377,6 +227,14 @@ const POLL_INTERVAL_RAPID = 1000
         setParsedResume(result.parsedResume)
         setShowParsedJSON(true)
         console.log("[v0] Resume parsed successfully")
+        
+        const successMessage: Message = {
+          id: Date.now().toString(),
+          type: "system",
+          content: "Resume parsed successfully! Check the parsed data below.",
+          timestamp: new Date(),
+        }
+        setMessages((prev) => [...prev, successMessage])
       } else {
         throw new Error(result.error || "Failed to parse resume")
       }
@@ -437,10 +295,11 @@ const POLL_INTERVAL_RAPID = 1000
       console.error("Error calling delete chat history API:", error)
     }
 
-    stopPolling()
     setMessages([])
     setParsedResume(null)
     setShowParsedJSON(false)
+    setIsWaiting(false)
+    setWaitTimeRemaining(0)
   }
 
   return (
@@ -487,19 +346,36 @@ const POLL_INTERVAL_RAPID = 1000
       <div className="max-w-4xl mx-auto p-4 h-[calc(100vh-80px)]">
         <Card className="h-full p-4 shadow-lg">
           <div className="h-full flex flex-col">
-            {/* Status indicator for soft skills waiting */}
-            {waitingForApiCall && secondsUntilApiCall > 0 && (
-              <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-lg">
-                <div className="flex items-center justify-between">
-                  <span className="text-blue-700 text-sm">
-                    ⏳ Soft skills analysis starting in {secondsUntilApiCall} seconds...
-                  </span>
-                  <div className="flex gap-1">
-                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
-                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.1s" }}></div>
-                    <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" style={{ animationDelay: "0.2s" }}></div>
-                  </div>
+            {/* Waiting Indicator */}
+            {isWaiting && (
+              <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg flex items-center gap-3">
+                <Clock className="w-5 h-5 text-amber-600 animate-pulse" />
+                <div className="flex-1">
+                  <p className="text-sm font-medium text-amber-800">Processing soft skills analysis...</p>
+                  <p className="text-xs text-amber-600">
+                    Time remaining: {(waitTimeRemaining / 1000).toFixed(1)}s
+                  </p>
                 </div>
+              </div>
+            )}
+
+            {/* Parsed JSON Display */}
+            {showParsedJSON && parsedResume && (
+              <div className="mb-4 p-4 bg-green-50 border border-green-200 rounded-lg">
+                <div className="flex justify-between items-center mb-2">
+                  <h3 className="font-semibold text-green-800">Parsed Resume Data</h3>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setShowParsedJSON(false)}
+                    className="text-green-700 border-green-300"
+                  >
+                    Close
+                  </Button>
+                </div>
+                <pre className="text-xs bg-white p-3 rounded border overflow-auto max-h-60">
+                  {JSON.stringify(parsedResume, null, 2)}
+                </pre>
               </div>
             )}
 
@@ -511,7 +387,6 @@ const POLL_INTERVAL_RAPID = 1000
                   </div>
                   <h2 className="text-xl font-semibold text-gray-800 mb-2">Welcome to Surikado!</h2>
                   <p className="text-gray-600">Start a conversation to find amazing job opportunities.</p>
-                  <p className="text-gray-500 text-sm mt-2">Ask about soft skills for detailed analysis</p>
                 </div>
               ) : (
                 messages.map((message) => (
@@ -522,32 +397,11 @@ const POLL_INTERVAL_RAPID = 1000
                           ? "bg-blue-600 text-white"
                           : message.type === "api"
                             ? "bg-green-100 text-green-800 border border-green-200"
-                            : message.type === "typing"
-                              ? "bg-gray-100 text-gray-600 border border-gray-200"
-                              : "bg-gray-100 text-gray-800"
+                            : "bg-gray-100 text-gray-800"
                       }`}
                     >
-                      {message.type === "typing" ? (
-                        <div className="flex items-center gap-2">
-                          <div className="flex gap-1">
-                            <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
-                            <div
-                              className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"
-                              style={{ animationDelay: "0.1s" }}
-                            ></div>
-                            <div
-                              className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"
-                              style={{ animationDelay: "0.2s" }}
-                            ></div>
-                          </div>
-                          <span className="text-sm">{message.content}</span>
-                        </div>
-                      ) : (
-                        <>
-                          <p className="text-sm whitespace-pre-wrap">{message.content}</p>
-                          <p className="text-xs opacity-70 mt-1">{message.timestamp.toLocaleTimeString()}</p>
-                        </>
-                      )}
+                      <p className="text-sm whitespace-pre-wrap">{message.content}</p>
+                      <p className="text-xs opacity-70 mt-1">{message.timestamp.toLocaleTimeString()}</p>
                     </div>
                   </div>
                 ))
@@ -559,11 +413,11 @@ const POLL_INTERVAL_RAPID = 1000
                 value={inputMessage}
                 onChange={(e) => setInputMessage(e.target.value)}
                 placeholder="Type your message..."
-                onKeyPress={(e) => e.key === "Enter" && !isLoading && handleSendMessage()}
+                onKeyPress={(e) => e.key === "Enter" && !isLoading && !isWaiting && handleSendMessage()}
                 className="flex-1"
-                disabled={isLoading}
+                disabled={isLoading || isWaiting}
               />
-              <Button onClick={handleSendMessage} disabled={isLoading}>
+              <Button onClick={handleSendMessage} disabled={isLoading || isWaiting}>
                 <Send className="w-4 h-4" />
               </Button>
             </div>
