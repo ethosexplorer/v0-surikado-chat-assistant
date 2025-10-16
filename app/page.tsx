@@ -23,12 +23,11 @@ export default function SurikadoChat() {
   const [toPhone, setToPhone] = useState("")
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
-  const typingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const [isPolling, setIsPolling] = useState(false)
-  const [isSoftSkillsQuery, setIsSoftSkillsQuery] = useState(false)
+  const [isApiProcessing, setIsApiProcessing] = useState(false)
 
-  const POLL_INTERVAL_MS = 3_000
-  const TYPING_INTERVAL_MS = 10_000 // 10 seconds
+  const POLL_INTERVAL_WAITING = 3000 // Poll every 3 seconds while waiting
+  const POLL_INTERVAL_PROCESSING = 5000 // Poll every 5 seconds when API is processing
 
   const shouldDelayForSoftSkills = (msgs: Message[]) => {
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -64,70 +63,30 @@ export default function SurikadoChat() {
       clearInterval(pollingIntervalRef.current)
       pollingIntervalRef.current = null
     }
-    stopTypingIndicator()
     setIsPolling(false)
     setIsLoading(false)
-    setIsSoftSkillsQuery(false)
-  }
-
-  const stopTypingIndicator = () => {
-    if (typingIntervalRef.current) {
-      clearInterval(typingIntervalRef.current)
-      typingIntervalRef.current = null
-    }
-    // Remove typing indicators
-    setMessages((prev) => prev.filter((msg) => msg.type !== "typing"))
-  }
-
-  const startTypingIndicator = () => {
-    console.log("[typing] Starting empty message indicators every 10 seconds")
-
-    // Add first empty message immediately
-    const firstTypingMessage: Message = {
-      id: `typing-${Date.now()}`,
-      type: "typing",
-      content: "...",
-      timestamp: new Date(),
-    }
-    setMessages((prev) => [...prev, firstTypingMessage])
-
-    // Continue adding empty messages every 10 seconds
-    typingIntervalRef.current = setInterval(() => {
-      console.log("[typing] Adding new empty message")
-
-      const newTypingMessage: Message = {
-        id: `typing-${Date.now()}`,
-        type: "typing",
-        content: "...",
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, newTypingMessage])
-    }, TYPING_INTERVAL_MS)
+    setIsApiProcessing(false)
   }
 
   const pollForResponse = async () => {
     try {
+      console.log("[polling] Checking for response...")
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           action: "poll",
-          toPhone: normalizeWhatsApp(toPhone), // was userPhone (undefined)
+          toPhone: normalizeWhatsApp(toPhone),
         }),
       })
 
-      const contentType = response.headers.get("content-type") || ""
-      let result: any
-      if (contentType.includes("application/json")) {
-        result = await response.json()
-      } else {
-        const text = await response.text()
-        result = { status: response.ok ? "text" : "error", message: text }
-      }
+      const result = await response.json()
+      console.log("[polling] Poll result:", result)
 
       if (!response.ok) {
+        stopPolling()
         setMessages((prev) => [
-          ...prev,
+          ...prev.filter((msg) => msg.type !== "typing"),
           {
             id: `${Date.now()}`,
             type: "system",
@@ -135,77 +94,102 @@ export default function SurikadoChat() {
             timestamp: new Date(),
           },
         ])
-        stopPolling()
         return
       }
 
+      // Handle different polling states
       if (result.status === "empty") {
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}`,
-            type: "api",
-            content: result.message || "...",
-            timestamp: new Date(),
-          },
-        ])
+        // Backend sent an empty message - update or add typing indicator
+        console.log("[polling] Empty message received:", result.message)
+        setMessages((prev) => {
+          // Remove old typing messages
+          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
+          // Add new typing message with the content from backend
+          return [
+            ...withoutTyping,
+            {
+              id: `typing-${Date.now()}`,
+              type: "typing",
+              content: result.message,
+              timestamp: new Date(),
+            },
+          ]
+        })
+      } else if (result.status === "processing") {
+        // Backend is processing the webhook call
+        console.log("[polling] Processing webhook...")
+        setMessages((prev) => {
+          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
+          return [
+            ...withoutTyping,
+            {
+              id: `typing-${Date.now()}`,
+              type: "typing",
+              content: result.message || "Processing your request...",
+              timestamp: new Date(),
+            },
+          ]
+        })
       } else if (result.status === "completed") {
+        // Final response received
+        console.log("[polling] Completed! Final message:", result.message)
         stopPolling()
         setMessages((prev) => [
-          ...prev,
+          ...prev.filter((msg) => msg.type !== "typing"),
           {
             id: `${Date.now()}`,
             type: "api",
-            content: result.message || "Response received",
+            content: result.message,
             timestamp: new Date(),
           },
         ])
-      } else if (result.status === "error") {
+      } else if (result.status === "waiting") {
+        // Still processing, keep polling
+        console.log("[polling] Still waiting...", result.elapsedSeconds)
+      } else if (result.status === "none") {
+        // No active conversation found
+        console.log("[polling] No active conversation")
         stopPolling()
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}`,
-            type: "system",
-            content: result.message || "An error occurred",
-            timestamp: new Date(),
-          },
-        ])
-      } else if (result.status === "expired") {
-        stopPolling()
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}`,
-            type: "system",
-            content: "Request expired",
-            timestamp: new Date(),
-          },
-        ])
       }
-      // pending/none: keep polling silently
     } catch (error) {
-      console.error("[v0] Error polling for response:", error)
-      // continue polling on network errors
+      console.error("[polling] Error:", error)
+      stopPolling()
+      setMessages((prev) => [
+        ...prev.filter((msg) => msg.type !== "typing"),
+        {
+          id: `${Date.now()}`,
+          type: "system",
+          content: "Error retrieving response",
+          timestamp: new Date(),
+        },
+      ])
     }
   }
 
-  const startPolling = (isSoftSkills: boolean) => {
+  const startPolling = () => {
+    console.log("[polling] Starting polling...")
     setIsPolling(true)
-    setIsSoftSkillsQuery(isSoftSkills)
+    setIsLoading(true)
+    setIsApiProcessing(false)
 
-    // Start empty messages for soft skills queries
-    if (isSoftSkills) {
-      startTypingIndicator()
-    }
+    // Add initial typing indicator
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `typing-${Date.now()}`,
+        type: "typing",
+        content: "Processing your response...",
+        timestamp: new Date(),
+      },
+    ])
 
-    // Poll immediately
+    // Start polling immediately
     pollForResponse()
 
-    // Then poll every POLL_INTERVAL_MS
+    // Poll every 3 seconds initially (will switch to 5s when API starts processing)
     pollingIntervalRef.current = setInterval(() => {
       pollForResponse()
-    }, POLL_INTERVAL_MS)
+    }, POLL_INTERVAL_WAITING)
   }
 
   // Cleanup on unmount
@@ -217,17 +201,6 @@ export default function SurikadoChat() {
 
   const handleSendMessage = async () => {
     if (!inputMessage.trim()) return
-
-    if (!toPhone.trim()) {
-      const warn: Message = {
-        id: `${Date.now()}`,
-        type: "system",
-        content: "Please enter your WhatsApp number",
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, warn])
-      return
-    }
 
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -241,6 +214,7 @@ export default function SurikadoChat() {
     setInputMessage("")
     setIsLoading(true)
 
+    // Check if this is a response to a soft skills question
     const isSoftSkills = shouldDelayForSoftSkills(messages)
 
     try {
@@ -251,14 +225,20 @@ export default function SurikadoChat() {
           action: "send",
           message: messageToSend,
           toPhone: normalizeWhatsApp(toPhone),
+          isSoftSkillsQuestion: isSoftSkills, // Tell backend this needs special handling
         }),
       })
 
       const result = await response.json()
+      console.log("[send] API response:", result)
 
-      if (response.ok && result.pending) {
-        startPolling(result.isSoftSkills || isSoftSkills)
+      if (response.ok && result.isSoftSkillsResponse) {
+        // Backend confirmed this is a soft skills response
+        // Start polling for empty messages and final response
+        console.log("[send] Soft skills response detected, starting polling")
+        startPolling()
       } else if (response.ok) {
+        // Normal response received immediately
         setIsLoading(false)
         const systemMessage: Message = {
           id: `${Date.now()}`,
@@ -268,6 +248,7 @@ export default function SurikadoChat() {
         }
         setMessages((prev) => [...prev, systemMessage])
       } else {
+        // Error occurred
         setIsLoading(false)
         const errorMessage: Message = {
           id: `${Date.now()}`,
@@ -380,6 +361,7 @@ export default function SurikadoChat() {
       console.error("Error calling delete chat history API:", error)
     }
 
+    stopPolling()
     setMessages([])
     setParsedResume(null)
     setShowParsedJSON(false)
@@ -387,7 +369,6 @@ export default function SurikadoChat() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
-      {/* Header - same as before */}
       <div className="bg-blue-600 text-white p-4 shadow-lg">
         <div className="max-w-4xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -428,10 +409,8 @@ export default function SurikadoChat() {
       </div>
 
       <div className="max-w-4xl mx-auto p-4 h-[calc(100vh-80px)]">
-        {/* Chat Window */}
         <Card className="h-full p-4 shadow-lg">
           <div className="h-full flex flex-col">
-            {/* Messages */}
             <div className="flex-1 overflow-y-auto space-y-4 mb-4">
               {messages.length === 0 ? (
                 <div className="flex flex-col items-center justify-center h-full text-center">
@@ -451,24 +430,24 @@ export default function SurikadoChat() {
                           : message.type === "api"
                             ? "bg-green-100 text-green-800 border border-green-200"
                             : message.type === "typing"
-                              ? "bg-gray-100 text-gray-500 border border-gray-200 italic"
+                              ? "bg-gray-100 text-gray-600 border border-gray-200"
                               : "bg-gray-100 text-gray-800"
                       }`}
                     >
                       {message.type === "typing" ? (
                         <div className="flex items-center gap-2">
-                          <span className="text-sm">Thinking</span>
                           <div className="flex gap-1">
-                            <div className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"></div>
+                            <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
                             <div
-                              className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"
+                              className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"
                               style={{ animationDelay: "0.1s" }}
                             ></div>
                             <div
-                              className="w-1.5 h-1.5 bg-gray-400 rounded-full animate-bounce"
+                              className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"
                               style={{ animationDelay: "0.2s" }}
                             ></div>
                           </div>
+                          <span className="text-sm">{message.content}</span>
                         </div>
                       ) : (
                         <>
@@ -480,27 +459,8 @@ export default function SurikadoChat() {
                   </div>
                 ))
               )}
-              {isLoading && !isPolling && (
-                <div className="flex justify-start">
-                  <div className="bg-gray-100 text-gray-800 px-4 py-2 rounded-lg">
-                    <div className="flex items-center gap-2">
-                      <div className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
-                      <div
-                        className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
-                        style={{ animationDelay: "0.1s" }}
-                      ></div>
-                      <div
-                        className="w-2 h-2 bg-gray-400 rounded-full animate-bounce"
-                        style={{ animationDelay: "0.2s" }}
-                      ></div>
-                      <span className="ml-2 text-sm">Sending message...</span>
-                    </div>
-                  </div>
-                </div>
-              )}
             </div>
 
-            {/* Input */}
             <div className="flex gap-2">
               <Input
                 value={inputMessage}
