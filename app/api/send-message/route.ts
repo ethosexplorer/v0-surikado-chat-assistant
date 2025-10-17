@@ -103,7 +103,7 @@ class ConversationStore {
 
 const TIMING = {
   EMPTY_MESSAGE_INTERVAL: 8000, // 8 seconds between empty messages
-  API_CALL_TIME: 88, // Call webhook after 88 seconds
+  API_CALL_TIME: 78, // Call webhook after 78 seconds (1.18 minutes)
   MAX_TOTAL_TIME: 180, // 3 minutes absolute maximum
   WEBHOOK_TIMEOUT: 120000, // 2 minutes for webhook call
   NORMAL_MESSAGE_TIMEOUT: 25000, // 25 seconds for normal messages
@@ -435,7 +435,7 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
     }
   }
 
-  // Time to call API (at 88 seconds)
+  // Time to call API (at 78 seconds)
   if (elapsedSeconds >= TIMING.API_CALL_TIME && !conversation.webhookCalled) {
     console.log(`[Poll] ⏰ Reached ${TIMING.API_CALL_TIME}s - CALLING API NOW`)
     
@@ -516,7 +516,7 @@ async function handleSendRequest(
       store.deleteResponse(userPhone)
     }
 
-    // Start tracking - API will be called at 88 seconds
+    // Start tracking - API will be called at 78 seconds
     store.setConversation(userPhone, {
       startTime: Date.now(),
       lastEmptyMessageTime: Date.now(),

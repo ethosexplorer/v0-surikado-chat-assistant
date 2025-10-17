@@ -33,8 +33,10 @@ export default function SurikadoChat() {
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const softSkillsDelayRef = useRef<NodeJS.Timeout | null>(null)
 
   const POLL_INTERVAL = 3000 // Poll every 3 seconds
+  const SOFT_SKILLS_DELAY = 78000 // 78 seconds = 1.18 minutes
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -45,6 +47,7 @@ export default function SurikadoChat() {
   useEffect(() => {
     return () => {
       stopPolling()
+      stopSoftSkillsDelay()
     }
   }, [])
 
@@ -87,6 +90,14 @@ export default function SurikadoChat() {
     }
     setIsPolling(false)
     setIsLoading(false)
+  }
+
+  // Stop soft skills delay
+  const stopSoftSkillsDelay = () => {
+    if (softSkillsDelayRef.current) {
+      clearTimeout(softSkillsDelayRef.current)
+      softSkillsDelayRef.current = null
+    }
   }
 
   // Poll for response from server
@@ -228,6 +239,28 @@ export default function SurikadoChat() {
     }, POLL_INTERVAL)
   }
 
+  // Handle soft skills delay and start polling
+  const handleSoftSkillsResponse = () => {
+    console.log("[SoftSkills] Starting 78-second delay before polling...")
+    
+    // Show initial waiting message
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `typing-${Date.now()}`,
+        type: "typing",
+        content: "⏳ Analyzing your soft skills request. This may take about 1-2 minutes...",
+        timestamp: new Date(),
+      },
+    ])
+
+    // Set timeout for 78 seconds before starting polling
+    softSkillsDelayRef.current = setTimeout(() => {
+      console.log("[SoftSkills] 78-second delay completed, starting polling...")
+      startPolling()
+    }, SOFT_SKILLS_DELAY)
+  }
+
   // Send message to API
   const handleSendMessage = async () => {
     if (!inputMessage.trim()) return
@@ -277,9 +310,9 @@ export default function SurikadoChat() {
       console.log("[Send] API response:", result)
 
       if (response.ok && result.isSoftSkillsResponse) {
-        // Start polling for soft skills response
-        console.log("[Send] Starting polling for soft skills response")
-        startPolling()
+        // Handle soft skills response with delay
+        console.log("[Send] Starting soft skills response flow with delay")
+        handleSoftSkillsResponse()
       } else if (response.ok) {
         // Normal immediate response
         setIsLoading(false)
@@ -438,6 +471,7 @@ export default function SurikadoChat() {
 
     // Clear local state
     stopPolling()
+    stopSoftSkillsDelay()
     setMessages([])
     setParsedResume(null)
     setShowParsedJSON(false)
