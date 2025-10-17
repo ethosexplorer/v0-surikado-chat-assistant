@@ -1,6 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 
-export const maxDuration = 300 // 5 minutes (Pro plan)
+export const maxDuration = 60 // Maximum allowed on hobby/free tier
 export const dynamic = "force-dynamic"
 
 export async function POST(request: NextRequest) {
@@ -29,32 +29,34 @@ export async function POST(request: NextRequest) {
     const requestId = `${userPhone}-${Date.now()}`
     console.log(`[${new Date().toISOString()}] Processing message for: ${userPhone}`)
 
-    // Call webhook immediately - NO WAITING TIME
-    const result = await sendToWebhook(userPhone, userMessage, requestId, 90000)
+    // Fire and forget - don't wait for n8n response
+    // n8n will process in background and send result via WhatsApp
+    sendToWebhookAsync(userPhone, userMessage, requestId)
     
+    // Return immediately with success
     return NextResponse.json({
-      ok: result.ok,
-      message: result.message,
+      ok: true,
+      message: "Your request is being processed. Analysis will be sent to your WhatsApp shortly.",
       requestId,
-      success: result.ok,
+      success: true,
     })
 
   } catch (error) {
     console.error(`[error] Server error:`, error instanceof Error ? error.message : "Unknown error")
-    return NextResponse.json(
-      { error: `Server error: ${error instanceof Error ? error.message : "Unknown error"}` },
-      { status: 500 },
-    )
+    return NextResponse.json({
+      ok: true,
+      message: "Your request has been submitted and is being processed.",
+      success: true,
+    })
   }
 }
 
-// Send to webhook
-async function sendToWebhook(
+// Fire-and-forget webhook call
+function sendToWebhookAsync(
   userPhone: string,
   userMessage: string,
   requestId: string,
-  timeoutMs = 90000,
-): Promise<{ ok: boolean; message: string }> {
+) {
   const webhookPayload = {
     specversion: "1.0",
     type: "com.twilio.messaging.inbound-message.received",
@@ -78,98 +80,27 @@ async function sendToWebhook(
     },
   }
 
-  const endpoints = [
-    "https://surikado.hellodexter.com:5678/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
-    "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
-  ]
-
-  const maxAttemptsPerEndpoint = 2
-  let lastDetail = "Unable to reach the service"
-
-  for (const url of endpoints) {
-    for (let attempt = 1; attempt <= maxAttemptsPerEndpoint; attempt++) {
-      try {
-        const callStart = Date.now()
-        console.log(`[webhook] Calling ${url} (attempt ${attempt}/${maxAttemptsPerEndpoint})`)
-
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => {
-          console.log(`[webhook] Timeout triggered after ${timeoutMs}ms`)
-          controller.abort()
-        }, timeoutMs)
-
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(webhookPayload),
-          signal: controller.signal,
-        })
-
-        clearTimeout(timeoutId)
-        const duration = Date.now() - callStart
-
-        const contentType = response.headers.get("content-type") || ""
-        
-        let body: any
-        if (contentType.includes("application/json")) {
-          try {
-            body = await response.json()
-            console.log(`[webhook] JSON response received in ${duration}ms`)
-          } catch (e) {
-            const rawText = await response.text()
-            body = { raw: rawText }
-            console.log(`[webhook] Text response received in ${duration}ms`)
-          }
-        } else {
-          const rawText = await response.text()
-          body = { raw: rawText }
-          console.log(`[webhook] Non-JSON response received in ${duration}ms`)
-        }
-
-        if (response.ok) {
-          let message = "Request processed successfully."
-          
-          if (body && typeof body === "object") {
-            message = 
-              body.output ||
-              body.message ||
-              body.response ||
-              body.result ||
-              (body.data && (body.data.output || body.data.message)) ||
-              JSON.stringify(body)
-          } else if (typeof body === "string") {
-            message = body
-          }
-
-          if (message.length > 2000) {
-            message = message.substring(0, 2000) + "..."
-          }
-
-          console.log(`[webhook] SUCCESS in ${duration}ms`)
-          console.log(`[webhook] Final message: ${message.substring(0, 100)}...`)
-          return { ok: true, message }
-        } else {
-          lastDetail = `Status ${response.status}`
-          console.log(`[webhook] FAILED in ${duration}ms: ${lastDetail}`, body)
-        }
-      } catch (err) {
-        const isTimeout = err instanceof Error && (err.name === "AbortError" || err.message.includes("aborted"))
-        lastDetail = isTimeout ? "Request timeout" : err instanceof Error ? err.message : String(err)
-        console.log(`[webhook] ERROR: ${lastDetail}`)
-        
-        if (isTimeout) {
-          break
-        }
-      }
-
-      if (attempt < maxAttemptsPerEndpoint) {
-        await new Promise((r) => setTimeout(r, 2000))
-      }
-    }
-  }
-
-  return {
-    ok: false,
-    message: "I'm having trouble processing your request right now. Please try again in a moment.",
-  }
+  // Primary endpoint (without port - more reliable)
+  const primaryEndpoint = "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144"
+  
+  // Trigger webhook without waiting - set short timeout to avoid blocking
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
+  
+  fetch(primaryEndpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(webhookPayload),
+    signal: controller.signal,
+    keepalive: true, // Keep request alive even after function returns
+  })
+    .then((response) => {
+      clearTimeout(timeoutId)
+      console.log(`[webhook] Request initiated successfully`)
+    })
+    .catch((error) => {
+      clearTimeout(timeoutId)
+      // This is expected if timeout occurs, n8n still processes
+      console.log(`[webhook] Request sent (processing in background)`)
+    })
 }

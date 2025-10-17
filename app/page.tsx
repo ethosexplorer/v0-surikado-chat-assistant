@@ -66,58 +66,59 @@ export default function SurikadoChat() {
     setMessages((prev) => [...prev, userMessage])
     const messageToSend = inputMessage
     setInputMessage("")
+    setIsLoading(true)
     
     // Check if message is about soft skills
     const isSoftSkills = isSoftSkillsMessage(messageToSend)
     
-    if (isSoftSkills) {
-      // Set waiting state and show countdown
-      setIsWaiting(true)
-      const waitTime = 1.20 * 60 * 1000 // 72,000 ms (1.20 minutes)
-      setWaitTimeRemaining(waitTime)
-      
-      const waitMessage: Message = {
-        id: `${Date.now()}-wait`,
-        type: "system",
-        content: `⏳ Processing soft skills analysis... This may take about ${Math.ceil(waitTime / 1000)} seconds.`,
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, waitMessage])
-      
-      // Update countdown every second
-      const interval = setInterval(() => {
-        setWaitTimeRemaining((prev) => {
-          const newTime = prev - 1000
-          if (newTime <= 0) {
-            clearInterval(interval)
-            return 0
+    try {
+      // Call API immediately for all messages
+      const response = await fetch("/api/send-message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "send",
+          message: messageToSend,
+          toPhone: normalizeWhatsApp(toPhone),
+        }),
+      })
+
+      const result = await response.json()
+      console.log("[send] API response:", result)
+
+      if (response.ok) {
+        if (isSoftSkills) {
+          // For soft skills messages, wait 1:16 minutes AFTER API call before showing response
+          setIsWaiting(true)
+          const waitTime = 92 * 1000 // 76 seconds = 1:16 minutes
+          setWaitTimeRemaining(waitTime)
+          
+          const waitMessage: Message = {
+            id: `${Date.now()}-wait`,
+            type: "system",
+            content: `⏳ Processing soft skills analysis... Please wait ${Math.ceil(waitTime / 1000)} seconds.`,
+            timestamp: new Date(),
           }
-          return newTime
-        })
-      }, 1000)
-      
-      // Wait for 1.20 minutes, then call the API
-      setTimeout(async () => {
-        clearInterval(interval)
-        setIsWaiting(false)
-        setWaitTimeRemaining(0)
-        setIsLoading(true)
-        
-        try {
-          const response = await fetch("/api/send-message", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              action: "send",
-              message: messageToSend,
-              toPhone: normalizeWhatsApp(toPhone),
-            }),
-          })
-
-          const result = await response.json()
-          console.log("[send] API response:", result)
-
-          if (response.ok) {
+          setMessages((prev) => [...prev, waitMessage])
+          
+          // Update countdown every second
+          const interval = setInterval(() => {
+            setWaitTimeRemaining((prev) => {
+              const newTime = prev - 1000
+              if (newTime <= 0) {
+                clearInterval(interval)
+                return 0
+              }
+              return newTime
+            })
+          }, 1000)
+          
+          // Wait for 1:16 minutes, then show the API response
+          setTimeout(() => {
+            clearInterval(interval)
+            setIsWaiting(false)
+            setWaitTimeRemaining(0)
+            
             const apiMessage: Message = {
               id: `${Date.now()}`,
               type: "api",
@@ -125,47 +126,9 @@ export default function SurikadoChat() {
               timestamp: new Date(),
             }
             setMessages((prev) => [...prev, apiMessage])
-          } else {
-            const errorMessage: Message = {
-              id: `${Date.now()}`,
-              type: "system",
-              content: result.error || "Failed to process message",
-              timestamp: new Date(),
-            }
-            setMessages((prev) => [...prev, errorMessage])
-          }
-        } catch (error) {
-          console.error("Error calling API:", error)
-          const errorMessage: Message = {
-            id: Date.now().toString(),
-            type: "system",
-            content: "Network error. Please try again.",
-            timestamp: new Date(),
-          }
-          setMessages((prev) => [...prev, errorMessage])
-        } finally {
-          setIsLoading(false)
-        }
-      }, waitTime)
-    } else {
-      // For non-soft skills messages, call API immediately
-      setIsLoading(true)
-      
-      try {
-        const response = await fetch("/api/send-message", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "send",
-            message: messageToSend,
-            toPhone: normalizeWhatsApp(toPhone),
-          }),
-        })
-
-        const result = await response.json()
-        console.log("[send] API response:", result)
-
-        if (response.ok) {
+          }, waitTime)
+        } else {
+          // For non-soft skills messages, show response immediately
           const apiMessage: Message = {
             id: `${Date.now()}`,
             type: "api",
@@ -173,27 +136,27 @@ export default function SurikadoChat() {
             timestamp: new Date(),
           }
           setMessages((prev) => [...prev, apiMessage])
-        } else {
-          const errorMessage: Message = {
-            id: `${Date.now()}`,
-            type: "system",
-            content: result.error || "Failed to process message",
-            timestamp: new Date(),
-          }
-          setMessages((prev) => [...prev, errorMessage])
         }
-      } catch (error) {
-        console.error("Error calling API:", error)
+      } else {
         const errorMessage: Message = {
-          id: Date.now().toString(),
+          id: `${Date.now()}`,
           type: "system",
-          content: "Network error. Please try again.",
+          content: result.error || "Failed to process message",
           timestamp: new Date(),
         }
         setMessages((prev) => [...prev, errorMessage])
-      } finally {
-        setIsLoading(false)
       }
+    } catch (error) {
+      console.error("Error calling API:", error)
+      const errorMessage: Message = {
+        id: Date.now().toString(),
+        type: "system",
+        content: "Network error. Please try again.",
+        timestamp: new Date(),
+      }
+      setMessages((prev) => [...prev, errorMessage])
+    } finally {
+      setIsLoading(false)
     }
   }
 
