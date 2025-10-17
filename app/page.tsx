@@ -36,7 +36,7 @@ export default function SurikadoChat() {
   const softSkillsDelayRef = useRef<NodeJS.Timeout | null>(null)
 
   const POLL_INTERVAL = 3000 // Poll every 3 seconds
-  const SOFT_SKILLS_DELAY = 78000 // 78 seconds = 1.18 minutes
+  const SOFT_SKILLS_DELAY = 79000 // 79 seconds = 1.19 minutes
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -61,24 +61,40 @@ export default function SurikadoChat() {
     return `whatsapp:${n}`
   }
 
-  // Check if last non-user message is asking about soft skills
-  const shouldDelayForSoftSkills = (msgs: Message[]): boolean => {
+  // Check if message is about soft skills
+  const isSoftSkillsQuestion = (message: string): boolean => {
+    const text = message.toLowerCase()
+    return (
+      /soft\s*skills?/.test(text) ||
+      /your\s+soft\s+skills?/.test(text) ||
+      /list.*soft\s*skills?/.test(text) ||
+      /what\s+soft\s+skills\s+do\s+you\s+excel\s+at/.test(text) ||
+      (/teamwork/.test(text) && /problem-?solving/.test(text)) ||
+      /communication/.test(text) ||
+      /leadership/.test(text) ||
+      /collaboration/.test(text)
+    )
+  }
+
+  // Check if we should apply delay for follow-up soft skills messages
+  const shouldDelayForSoftSkills = (msgs: Message[], currentMessage: string): boolean => {
+    // Check if current message is about soft skills
+    if (!isSoftSkillsQuestion(currentMessage)) {
+      return false
+    }
+
+    // Check if there was a previous soft skills response in the conversation
     for (let i = msgs.length - 1; i >= 0; i--) {
-      const m = msgs[i]
-      if (m.type !== "user") {
-        const text = (m.content || "").toLowerCase()
-        if (
-          /soft\s*skills?/.test(text) ||
-          /your\s+soft\s+skills?/.test(text) ||
-          /list.*soft\s*skills?/.test(text) ||
-          /what\s+soft\s+skills\s+do\s+you\s+excel\s+at/.test(text) ||
-          (/teamwork/.test(text) && /problem-?solving/.test(text))
-        ) {
-          return true
-        }
-        return false
+      const msg = msgs[i]
+      if (msg.type === "api" && isSoftSkillsQuestion(msg.content)) {
+        return true // This is a follow-up to a previous soft skills response
+      }
+      if (msg.type === "user" && isSoftSkillsQuestion(msg.content)) {
+        // If we find a user soft skills message but no API response yet, don't delay
+        continue
       }
     }
+    
     return false
   }
 
@@ -240,8 +256,8 @@ export default function SurikadoChat() {
   }
 
   // Handle soft skills delay and start polling
-  const handleSoftSkillsResponse = () => {
-    console.log("[SoftSkills] Starting 78-second delay before polling...")
+  const handleSoftSkillsFollowUp = () => {
+    console.log("[SoftSkills] Starting 79-second delay for follow-up response...")
     
     // Show initial waiting message
     setMessages((prev) => [
@@ -249,14 +265,14 @@ export default function SurikadoChat() {
       {
         id: `typing-${Date.now()}`,
         type: "typing",
-        content: "⏳ Analyzing your soft skills request. This may take about 1-2 minutes...",
+        content: "⏳ Processing your soft skills follow-up. This may take about 1-2 minutes...",
         timestamp: new Date(),
       },
     ])
 
-    // Set timeout for 78 seconds before starting polling
+    // Set timeout for 79 seconds before starting polling
     softSkillsDelayRef.current = setTimeout(() => {
-      console.log("[SoftSkills] 78-second delay completed, starting polling...")
+      console.log("[SoftSkills] 79-second delay completed, starting polling...")
       startPolling()
     }, SOFT_SKILLS_DELAY)
   }
@@ -290,9 +306,9 @@ export default function SurikadoChat() {
     setInputMessage("")
     setIsLoading(true)
 
-    // Check if this is a soft skills response
-    const isSoftSkills = shouldDelayForSoftSkills(messages)
-    console.log("[Send] Is soft skills question:", isSoftSkills)
+    // Check if this is a follow-up soft skills message that requires delay
+    const isFollowUpSoftSkills = shouldDelayForSoftSkills(messages, messageToSend)
+    console.log("[Send] Is follow-up soft skills question:", isFollowUpSoftSkills)
 
     try {
       const response = await fetch("/api/send-message", {
@@ -302,7 +318,7 @@ export default function SurikadoChat() {
           action: "send",
           message: messageToSend,
           toPhone: normalizeWhatsApp(toPhone),
-          isSoftSkillsQuestion: isSoftSkills,
+          isSoftSkillsQuestion: isFollowUpSoftSkills, // Only delay for follow-ups
         }),
       })
 
@@ -310,9 +326,24 @@ export default function SurikadoChat() {
       console.log("[Send] API response:", result)
 
       if (response.ok && result.isSoftSkillsResponse) {
-        // Handle soft skills response with delay
-        console.log("[Send] Starting soft skills response flow with delay")
-        handleSoftSkillsResponse()
+        // Handle soft skills follow-up response with delay
+        if (isFollowUpSoftSkills) {
+          console.log("[Send] Starting soft skills follow-up response flow with delay")
+          handleSoftSkillsFollowUp()
+        } else {
+          // First soft skills response - show immediately
+          console.log("[Send] First soft skills response - showing immediately")
+          setIsLoading(false)
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `${Date.now()}`,
+              type: "api",
+              content: result.message || "Message sent successfully",
+              timestamp: new Date(),
+            },
+          ])
+        }
       } else if (response.ok) {
         // Normal immediate response
         setIsLoading(false)

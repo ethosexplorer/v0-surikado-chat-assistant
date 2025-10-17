@@ -21,6 +21,7 @@ interface ConversationState {
   emptyMessageCount: number
   webhookStartTime?: number
   processingStarted: boolean
+  isSoftSkillsFollowUp: boolean
 }
 
 interface FinalResponse {
@@ -103,7 +104,7 @@ class ConversationStore {
 
 const TIMING = {
   EMPTY_MESSAGE_INTERVAL: 8000, // 8 seconds between empty messages
-  API_CALL_TIME: 78, // Call webhook after 78 seconds (1.18 minutes)
+  API_CALL_TIME: 79, // Call webhook after 79 seconds (1.19 minutes) for follow-ups
   MAX_TOTAL_TIME: 180, // 3 minutes absolute maximum
   WEBHOOK_TIMEOUT: 120000, // 2 minutes for webhook call
   NORMAL_MESSAGE_TIMEOUT: 25000, // 25 seconds for normal messages
@@ -435,7 +436,7 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
     }
   }
 
-  // Time to call API (at 78 seconds)
+  // Time to call API (at 79 seconds for follow-ups)
   if (elapsedSeconds >= TIMING.API_CALL_TIME && !conversation.webhookCalled) {
     console.log(`[Poll] ⏰ Reached ${TIMING.API_CALL_TIME}s - CALLING API NOW`)
     
@@ -507,7 +508,7 @@ async function handleSendRequest(
   console.log(`[Send] Message:`, userMessage.substring(0, 50))
 
   if (isSoftSkillsQuestion) {
-    console.log(`[Send] Starting soft skills response flow`)
+    console.log(`[Send] Starting soft skills follow-up response flow`)
 
     // Clean up existing conversation
     if (store.hasConversation(userPhone)) {
@@ -516,7 +517,7 @@ async function handleSendRequest(
       store.deleteResponse(userPhone)
     }
 
-    // Start tracking - API will be called at 78 seconds
+    // Start tracking - API will be called at 79 seconds for follow-ups
     store.setConversation(userPhone, {
       startTime: Date.now(),
       lastEmptyMessageTime: Date.now(),
@@ -525,9 +526,10 @@ async function handleSendRequest(
       webhookCalled: false,
       emptyMessageCount: 0,
       processingStarted: false,
+      isSoftSkillsFollowUp: true,
     })
 
-    console.log(`[Send] Conversation started. API will be called at ${TIMING.API_CALL_TIME}s`)
+    console.log(`[Send] Follow-up conversation started. API will be called at ${TIMING.API_CALL_TIME}s`)
 
     return NextResponse.json({
       ok: true,
