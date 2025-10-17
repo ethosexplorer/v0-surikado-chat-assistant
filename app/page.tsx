@@ -13,6 +13,14 @@ interface Message {
   timestamp: Date
 }
 
+interface PollResult {
+  status: "waiting" | "empty" | "processing" | "completed" | "none"
+  message: string
+  elapsedSeconds?: number
+  completed: boolean
+  success?: boolean
+}
+
 export default function SurikadoChat() {
   const [messages, setMessages] = useState<Message[]>([])
   const [inputMessage, setInputMessage] = useState("")
@@ -21,25 +29,47 @@ export default function SurikadoChat() {
   const [showParsedJSON, setShowParsedJSON] = useState(false)
   const [parsedResume, setParsedResume] = useState<any>(null)
   const [toPhone, setToPhone] = useState("")
+  const [isPolling, setIsPolling] = useState(false)
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
-  const [isPolling, setIsPolling] = useState(false)
-  const [isApiProcessing, setIsApiProcessing] = useState(false)
+  const messagesEndRef = useRef<HTMLDivElement>(null)
 
-  const POLL_INTERVAL_WAITING = 3000 // Poll every 3 seconds while waiting
-  const POLL_INTERVAL_PROCESSING = 5000 // Poll every 5 seconds when API is processing
+  const POLL_INTERVAL = 3000 // Poll every 3 seconds
 
-  const shouldDelayForSoftSkills = (msgs: Message[]) => {
+  // Auto-scroll to bottom when messages change
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [messages])
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      stopPolling()
+    }
+  }, [])
+
+  // Normalize WhatsApp number
+  const normalizeWhatsApp = (raw: string): string => {
+    if (!raw) return ""
+    let n = String(raw).trim()
+    if (n.toLowerCase().startsWith("whatsapp:")) n = n.slice(9)
+    n = n.replace(/[^+\d]/g, "")
+    if (!n.startsWith("+")) n = `+${n}`
+    return `whatsapp:${n}`
+  }
+
+  // Check if last non-user message is asking about soft skills
+  const shouldDelayForSoftSkills = (msgs: Message[]): boolean => {
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]
       if (m.type !== "user") {
-        const t = (m.content || "").toLowerCase()
+        const text = (m.content || "").toLowerCase()
         if (
-          /soft\s*skills?/.test(t) ||
-          /your\s+soft\s+skills?/.test(t) ||
-          /list.*soft\s*skills?/.test(t) ||
-          /what\s+soft\s+skills\s+do\s+you\s+excel\s+at/.test(t) ||
-          (/teamwork/.test(t) && /problem-?solving/.test(t))
+          /soft\s*skills?/.test(text) ||
+          /your\s+soft\s+skills?/.test(text) ||
+          /list.*soft\s*skills?/.test(text) ||
+          /what\s+soft\s+skills\s+do\s+you\s+excel\s+at/.test(text) ||
+          (/teamwork/.test(text) && /problem-?solving/.test(text))
         ) {
           return true
         }
@@ -49,15 +79,7 @@ export default function SurikadoChat() {
     return false
   }
 
-  const normalizeWhatsApp = (raw: string) => {
-    if (!raw) return ""
-    let n = String(raw).trim()
-    if (n.toLowerCase().startsWith("whatsapp:")) n = n.slice(9)
-    n = n.replace(/[^+\d]/g, "")
-    if (!n.startsWith("+")) n = `+${n}`
-    return `whatsapp:${n}`
-  }
-
+  // Stop polling
   const stopPolling = () => {
     if (pollingIntervalRef.current) {
       clearInterval(pollingIntervalRef.current)
@@ -65,12 +87,13 @@ export default function SurikadoChat() {
     }
     setIsPolling(false)
     setIsLoading(false)
-    setIsApiProcessing(false)
   }
 
+  // Poll for response from server
   const pollForResponse = async () => {
     try {
-      console.log("[polling] Checking for response...")
+      console.log("[Polling] Checking for response...")
+      
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -80,10 +103,9 @@ export default function SurikadoChat() {
         }),
       })
 
-      const result = await response.json()
-      console.log("[polling] Poll result:", result)
-
       if (!response.ok) {
+        const result = await response.json()
+        console.error("[Polling] Error:", result)
         stopPolling()
         setMessages((prev) => [
           ...prev.filter((msg) => msg.type !== "typing"),
@@ -97,80 +119,94 @@ export default function SurikadoChat() {
         return
       }
 
+      const result: PollResult = await response.json()
+      console.log("[Polling] Result:", result)
+
       // Handle different polling states
-      if (result.status === "empty") {
-        // Backend sent an empty message - update or add typing indicator
-        console.log("[polling] Empty message received:", result.message)
-        setMessages((prev) => {
-          // Remove old typing messages
-          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-          // Add new typing message with the content from backend
-          return [
-            ...withoutTyping,
+      switch (result.status) {
+        case "empty":
+          // Update typing indicator with new message
+          console.log("[Polling] Empty message:", result.message)
+          setMessages((prev) => {
+            const withoutTyping = prev.filter((msg) => msg.type !== "typing")
+            return [
+              ...withoutTyping,
+              {
+                id: `typing-${Date.now()}`,
+                type: "typing",
+                content: result.message,
+                timestamp: new Date(),
+              },
+            ]
+          })
+          break
+
+        case "processing":
+          // Show processing status
+          console.log("[Polling] Processing webhook...")
+          setMessages((prev) => {
+            const withoutTyping = prev.filter((msg) => msg.type !== "typing")
+            return [
+              ...withoutTyping,
+              {
+                id: `typing-${Date.now()}`,
+                type: "typing",
+                content: result.message || "⚡ Processing your request...",
+                timestamp: new Date(),
+              },
+            ]
+          })
+          break
+
+        case "completed":
+          // Final response received - stop polling
+          console.log("[Polling] Completed! Message:", result.message)
+          stopPolling()
+          setMessages((prev) => [
+            ...prev.filter((msg) => msg.type !== "typing"),
             {
-              id: `typing-${Date.now()}`,
-              type: "typing",
+              id: `${Date.now()}`,
+              type: "api",
               content: result.message,
               timestamp: new Date(),
             },
-          ]
-        })
-      } else if (result.status === "processing") {
-        // Backend is processing the webhook call
-        console.log("[polling] Processing webhook...")
-        setMessages((prev) => {
-          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-          return [
-            ...withoutTyping,
-            {
-              id: `typing-${Date.now()}`,
-              type: "typing",
-              content: result.message || "Processing your request...",
-              timestamp: new Date(),
-            },
-          ]
-        })
-      } else if (result.status === "completed") {
-        // Final response received
-        console.log("[polling] Completed! Final message:", result.message)
-        stopPolling()
-        setMessages((prev) => [
-          ...prev.filter((msg) => msg.type !== "typing"),
-          {
-            id: `${Date.now()}`,
-            type: "api",
-            content: result.message,
-            timestamp: new Date(),
-          },
-        ])
-      } else if (result.status === "waiting") {
-        // Still processing, keep polling
-        console.log("[polling] Still waiting...", result.elapsedSeconds)
-      } else if (result.status === "none") {
-        // No active conversation found
-        console.log("[polling] No active conversation")
-        stopPolling()
+          ])
+          break
+
+        case "waiting":
+          // Still waiting - keep polling
+          console.log("[Polling] Waiting... Elapsed:", result.elapsedSeconds)
+          break
+
+        case "none":
+          // No active conversation
+          console.log("[Polling] No active conversation")
+          stopPolling()
+          break
+
+        default:
+          console.warn("[Polling] Unknown status:", result.status)
       }
     } catch (error) {
-      console.error("[polling] Error:", error)
+      console.error("[Polling] Exception:", error)
       stopPolling()
       setMessages((prev) => [
         ...prev.filter((msg) => msg.type !== "typing"),
         {
           id: `${Date.now()}`,
           type: "system",
-          content: "Error retrieving response",
+          content: "Error retrieving response. Please try again.",
           timestamp: new Date(),
         },
       ])
     }
   }
 
+  // Start polling process
   const startPolling = () => {
-    console.log("[polling] Starting polling...")
+    console.log("[Polling] Starting...")
     setIsPolling(true)
     setIsLoading(true)
-    setIsApiProcessing(false)
 
     // Add initial typing indicator
     setMessages((prev) => [
@@ -178,7 +214,7 @@ export default function SurikadoChat() {
       {
         id: `typing-${Date.now()}`,
         type: "typing",
-        content: "Processing your response...",
+        content: "🔄 Processing your response...",
         timestamp: new Date(),
       },
     ])
@@ -186,36 +222,44 @@ export default function SurikadoChat() {
     // Start polling immediately
     pollForResponse()
 
-    // Poll every 3 seconds initially (will switch to 5s when API starts processing)
+    // Continue polling at intervals
     pollingIntervalRef.current = setInterval(() => {
       pollForResponse()
-    }, POLL_INTERVAL_WAITING)
+    }, POLL_INTERVAL)
   }
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      stopPolling()
-    }
-  }, [])
-
+  // Send message to API
   const handleSendMessage = async () => {
     if (!inputMessage.trim()) return
+    if (!toPhone.trim()) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}`,
+          type: "system",
+          content: "Please enter your WhatsApp number first.",
+          timestamp: new Date(),
+        },
+      ])
+      return
+    }
 
+    // Add user message to UI
     const userMessage: Message = {
       id: Date.now().toString(),
       type: "user",
       content: inputMessage,
       timestamp: new Date(),
     }
-
     setMessages((prev) => [...prev, userMessage])
+
     const messageToSend = inputMessage
     setInputMessage("")
     setIsLoading(true)
 
-    // Check if this is a response to a soft skills question
+    // Check if this is a soft skills response
     const isSoftSkills = shouldDelayForSoftSkills(messages)
+    console.log("[Send] Is soft skills question:", isSoftSkills)
 
     try {
       const response = await fetch("/api/send-message", {
@@ -225,67 +269,81 @@ export default function SurikadoChat() {
           action: "send",
           message: messageToSend,
           toPhone: normalizeWhatsApp(toPhone),
-          isSoftSkillsQuestion: isSoftSkills, // Tell backend this needs special handling
+          isSoftSkillsQuestion: isSoftSkills,
         }),
       })
 
       const result = await response.json()
-      console.log("[send] API response:", result)
+      console.log("[Send] API response:", result)
 
       if (response.ok && result.isSoftSkillsResponse) {
-        // Backend confirmed this is a soft skills response
-        // Start polling for empty messages and final response
-        console.log("[send] Soft skills response detected, starting polling")
+        // Start polling for soft skills response
+        console.log("[Send] Starting polling for soft skills response")
         startPolling()
       } else if (response.ok) {
-        // Normal response received immediately
+        // Normal immediate response
         setIsLoading(false)
-        const systemMessage: Message = {
-          id: `${Date.now()}`,
-          type: "api",
-          content: result.message || "Message sent",
-          timestamp: new Date(),
-        }
-        setMessages((prev) => [...prev, systemMessage])
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "api",
+            content: result.message || "Message sent successfully",
+            timestamp: new Date(),
+          },
+        ])
       } else {
         // Error occurred
         setIsLoading(false)
-        const errorMessage: Message = {
-          id: `${Date.now()}`,
-          type: "system",
-          content: result.error || "Failed to send message",
-          timestamp: new Date(),
-        }
-        setMessages((prev) => [...prev, errorMessage])
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "system",
+            content: result.error || "Failed to send message",
+            timestamp: new Date(),
+          },
+        ])
       }
     } catch (error) {
-      console.error("Error calling API:", error)
+      console.error("[Send] Error:", error)
       setIsLoading(false)
-      const errorMessage: Message = {
-        id: Date.now().toString(),
-        type: "system",
-        content: "Network error. Please try again.",
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, errorMessage])
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          type: "system",
+          content: "Network error. Please check your connection and try again.",
+          timestamp: new Date(),
+        },
+      ])
     }
   }
 
+  // Parse chat history into resume JSON
   const handleParseJSON = async () => {
-    console.log("[v0] Parse JSON button clicked")
-    console.log("[v0] Messages length:", messages.length)
+    console.log("[Parse] Starting parse process")
 
     if (messages.length === 0) {
-      console.log("[v0] No messages to parse, returning early")
+      console.log("[Parse] No messages to parse")
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}`,
+          type: "system",
+          content: "No conversation history to parse yet.",
+          timestamp: new Date(),
+        },
+      ])
       return
     }
 
     setIsParsing(true)
-    console.log("[v0] Starting parse process")
 
     try {
-      const chatHistory = messages.map((msg) => `${msg.type}: ${msg.content}`).join("\n")
-      console.log("[v0] Chat history prepared:", chatHistory.substring(0, 200) + "...")
+      const chatHistory = messages
+        .map((msg) => `${msg.type}: ${msg.content}`)
+        .join("\n")
 
       const response = await fetch("/api/parse-resume", {
         method: "POST",
@@ -293,82 +351,102 @@ export default function SurikadoChat() {
         body: JSON.stringify({ chatHistory }),
       })
 
-      console.log("[v0] API response status:", response.status)
       const result = await response.json()
-      console.log("[v0] API response result:", result)
+      console.log("[Parse] Result:", result)
 
       if (response.ok) {
         setParsedResume(result.parsedResume)
         setShowParsedJSON(true)
-        console.log("[v0] Resume parsed successfully")
+        console.log("[Parse] Success")
+        
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `${Date.now()}`,
+            type: "system",
+            content: "✅ Resume parsed successfully! Check the JSON output below.",
+            timestamp: new Date(),
+          },
+        ])
       } else {
         throw new Error(result.error || "Failed to parse resume")
       }
     } catch (error) {
-      console.error("[v0] Error parsing JSON:", error)
-      const errorMessage: Message = {
-        id: Date.now().toString(),
-        type: "system",
-        content: `Parse Error: ${error instanceof Error ? error.message : "Failed to parse resume"}`,
-        timestamp: new Date(),
-      }
-      setMessages((prev) => [...prev, errorMessage])
+      console.error("[Parse] Error:", error)
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: Date.now().toString(),
+          type: "system",
+          content: `Parse Error: ${error instanceof Error ? error.message : "Failed to parse resume"}`,
+          timestamp: new Date(),
+        },
+      ])
     } finally {
       setIsParsing(false)
-      console.log("[v0] Parse process completed")
     }
   }
 
+  // Clear cache and reset conversation
   const handleClearCache = async () => {
     try {
       const sessionId = toPhone.trim() ? normalizeWhatsApp(toPhone) : ""
+      
       if (sessionId) {
-        const response = await fetch("https://surikado.hellodexter.com/webhook/delete-chat-history", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            specversion: "1.0",
-            type: "com.twilio.messaging.inbound-message.received",
-            source:
-              "/2010-04-01/Accounts/AC24c60aa1d6a19f352f19a63198bd4252/Messages/SM0784303f394b6086ce8fdcf707284eb9.json",
-            id: "EZ279e45baa01be63f2aff062dbad97817",
-            dataschema: "https://events-schemas.twilio.com/Messaging.InboundMessageV1/5",
-            datacontenttype: "application/json",
-            time: new Date().toISOString(),
-            data: {
-              numMedia: 0,
-              timestamp: new Date().toISOString(),
-              recipients: [],
-              accountSid: "AC24c60aa1d6a19f352f19a63198bd4252",
-              messagingServiceSid: "MG6bf385d0da89ad4660cc24875ebb1ec4",
-              to: "whatsapp:+447418633913",
-              numSegments: 1,
-              messageSid: "SM0784303f394b6086ce8fdcf707284eb9",
-              eventName: "com.twilio.messaging.inbound-message.received",
-              body: "Clear chat history",
-              database: "surikadodb",
-              collection: "n8n_chat_histories",
-              sessionId,
-            },
-          }),
-        })
+        // Call backend to clear chat history
+        const response = await fetch(
+          "https://surikado.hellodexter.com/webhook/delete-chat-history",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              specversion: "1.0",
+              type: "com.twilio.messaging.inbound-message.received",
+              source: "/some-path",
+              id: `clear-${Date.now()}`,
+              dataschema: "https://events-schemas.twilio.com/Messaging.InboundMessageV1/5",
+              datacontenttype: "application/json",
+              time: new Date().toISOString(),
+              data: {
+                numMedia: 0,
+                timestamp: new Date().toISOString(),
+                recipients: [],
+                accountSid: "ACxxxx",
+                messagingServiceSid: "MGxxxx",
+                to: "whatsapp:+447418633913",
+                numSegments: 1,
+                messageSid: `clear-${Date.now()}`,
+                eventName: "com.twilio.messaging.inbound-message.received",
+                body: "Clear chat history",
+                database: "surikadodb",
+                collection: "n8n_chat_histories",
+                sessionId,
+              },
+            }),
+          }
+        )
 
         if (!response.ok) {
-          console.error("Failed to delete chat history from server")
+          console.error("[Clear] Failed to delete chat history from server")
+        } else {
+          console.log("[Clear] Chat history cleared from server")
         }
       }
     } catch (error) {
-      console.error("Error calling delete chat history API:", error)
+      console.error("[Clear] Error calling delete API:", error)
     }
 
+    // Clear local state
     stopPolling()
     setMessages([])
     setParsedResume(null)
     setShowParsedJSON(false)
+    console.log("[Clear] Local cache cleared")
   }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
+      {/* Header */}
       <div className="bg-blue-600 text-white p-4 shadow-lg">
         <div className="max-w-4xl mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -382,8 +460,8 @@ export default function SurikadoChat() {
             <Input
               value={toPhone}
               onChange={(e) => setToPhone(e.target.value)}
-              placeholder="Your WhatsApp number e.g. +123456789"
-              className="w-60 bg-white/10 text-white placeholder:text-blue-100 border-white/20"
+              placeholder="WhatsApp: +1234567890"
+              className="w-60 bg-white/10 text-white placeholder:text-blue-200 border-white/20"
             />
             <Button
               variant="secondary"
@@ -393,7 +471,7 @@ export default function SurikadoChat() {
               className="bg-white/10 hover:bg-white/20 text-white border-white/20"
             >
               <FileText className="w-4 h-4 mr-1" />
-              {isParsing ? "Parsing..." : "Parse JSON"}
+              {isParsing ? "Parsing..." : "Parse"}
             </Button>
             <Button
               variant="secondary"
@@ -402,27 +480,36 @@ export default function SurikadoChat() {
               className="bg-white/10 hover:bg-white/20 text-white border-white/20"
             >
               <Trash2 className="w-4 h-4 mr-1" />
-              Clear Cache
+              Clear
             </Button>
           </div>
         </div>
       </div>
 
+      {/* Main Chat Area */}
       <div className="max-w-4xl mx-auto p-4 h-[calc(100vh-80px)]">
-        <Card className="h-full p-4 shadow-lg">
-          <div className="h-full flex flex-col">
-            <div className="flex-1 overflow-y-auto space-y-4 mb-4">
-              {messages.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full text-center">
-                  <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mb-4">
-                    <MessageCircle className="w-8 h-8 text-blue-600" />
-                  </div>
-                  <h2 className="text-xl font-semibold text-gray-800 mb-2">Welcome to Surikado!</h2>
-                  <p className="text-gray-600">Start a conversation to find amazing job opportunities.</p>
+        <Card className="h-full p-4 shadow-lg flex flex-col">
+          {/* Messages Container */}
+          <div className="flex-1 overflow-y-auto space-y-4 mb-4">
+            {messages.length === 0 ? (
+              <div className="flex flex-col items-center justify-center h-full text-center">
+                <div className="w-16 h-16 bg-blue-100 rounded-full flex items-center justify-center mb-4">
+                  <MessageCircle className="w-8 h-8 text-blue-600" />
                 </div>
-              ) : (
-                messages.map((message) => (
-                  <div key={message.id} className={`flex ${message.type === "user" ? "justify-end" : "justify-start"}`}>
+                <h2 className="text-xl font-semibold text-gray-800 mb-2">
+                  Welcome to Surikado!
+                </h2>
+                <p className="text-gray-600">
+                  Start a conversation to find amazing job opportunities.
+                </p>
+              </div>
+            ) : (
+              <>
+                {messages.map((message) => (
+                  <div
+                    key={message.id}
+                    className={`flex ${message.type === "user" ? "justify-end" : "justify-start"}`}
+                  >
                     <div
                       className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
                         message.type === "user"
@@ -437,43 +524,67 @@ export default function SurikadoChat() {
                       {message.type === "typing" ? (
                         <div className="flex items-center gap-2">
                           <div className="flex gap-1">
-                            <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"></div>
+                            <div className="w-2 h-2 bg-blue-400 rounded-full animate-bounce" />
                             <div
                               className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"
                               style={{ animationDelay: "0.1s" }}
-                            ></div>
+                            />
                             <div
                               className="w-2 h-2 bg-blue-400 rounded-full animate-bounce"
                               style={{ animationDelay: "0.2s" }}
-                            ></div>
+                            />
                           </div>
                           <span className="text-sm">{message.content}</span>
                         </div>
                       ) : (
                         <>
                           <p className="text-sm whitespace-pre-wrap">{message.content}</p>
-                          <p className="text-xs opacity-70 mt-1">{message.timestamp.toLocaleTimeString()}</p>
+                          <p className="text-xs opacity-70 mt-1">
+                            {message.timestamp.toLocaleTimeString()}
+                          </p>
                         </>
                       )}
                     </div>
                   </div>
-                ))
-              )}
-            </div>
+                ))}
+                <div ref={messagesEndRef} />
+              </>
+            )}
+          </div>
 
-            <div className="flex gap-2">
-              <Input
-                value={inputMessage}
-                onChange={(e) => setInputMessage(e.target.value)}
-                placeholder="Type your message..."
-                onKeyPress={(e) => e.key === "Enter" && !isLoading && handleSendMessage()}
-                className="flex-1"
-                disabled={isLoading}
-              />
-              <Button onClick={handleSendMessage} disabled={isLoading}>
-                <Send className="w-4 h-4" />
-              </Button>
+          {/* Parsed JSON Display */}
+          {showParsedJSON && parsedResume && (
+            <div className="mb-4 p-4 bg-gray-50 rounded-lg border border-gray-200 max-h-40 overflow-y-auto">
+              <div className="flex justify-between items-center mb-2">
+                <h3 className="font-semibold text-sm">Parsed Resume JSON</h3>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setShowParsedJSON(false)}
+                  className="h-6 px-2"
+                >
+                  ✕
+                </Button>
+              </div>
+              <pre className="text-xs overflow-x-auto">
+                {JSON.stringify(parsedResume, null, 2)}
+              </pre>
             </div>
+          )}
+
+          {/* Input Area */}
+          <div className="flex gap-2">
+            <Input
+              value={inputMessage}
+              onChange={(e) => setInputMessage(e.target.value)}
+              placeholder="Type your message..."
+              onKeyPress={(e) => e.key === "Enter" && !isLoading && handleSendMessage()}
+              className="flex-1"
+              disabled={isLoading}
+            />
+            <Button onClick={handleSendMessage} disabled={isLoading || !inputMessage.trim()}>
+              <Send className="w-4 h-4" />
+            </Button>
           </div>
         </Card>
       </div>
