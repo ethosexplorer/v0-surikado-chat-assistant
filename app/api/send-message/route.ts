@@ -104,7 +104,7 @@ class ConversationStore {
 
 const TIMING = {
   EMPTY_MESSAGE_INTERVAL: 8000, // 8 seconds between empty messages
-  API_CALL_TIME: 79, // Call webhook after 79 seconds (1.19 minutes) for follow-ups
+  API_CALL_TIME: 76, // Call webhook after 76 seconds (1:16 minutes) for follow-ups
   MAX_TOTAL_TIME: 180, // 3 minutes absolute maximum
   WEBHOOK_TIMEOUT: 120000, // 2 minutes for webhook call
   NORMAL_MESSAGE_TIMEOUT: 25000, // 25 seconds for normal messages
@@ -436,7 +436,7 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
     }
   }
 
-  // Time to call API (at 79 seconds for follow-ups)
+  // Time to call API (at 76 seconds for follow-ups)
   if (elapsedSeconds >= TIMING.API_CALL_TIME && !conversation.webhookCalled) {
     console.log(`[Poll] ⏰ Reached ${TIMING.API_CALL_TIME}s - CALLING API NOW`)
     
@@ -517,7 +517,7 @@ async function handleSendRequest(
       store.deleteResponse(userPhone)
     }
 
-    // Start tracking - API will be called at 79 seconds for follow-ups
+    // Start tracking - API will be called at 76 seconds for follow-ups
     store.setConversation(userPhone, {
       startTime: Date.now(),
       lastEmptyMessageTime: Date.now(),
@@ -529,7 +529,7 @@ async function handleSendRequest(
       isSoftSkillsFollowUp: true,
     })
 
-    console.log(`[Send] Follow-up conversation started. API will be called at ${TIMING.API_CALL_TIME}s`)
+    console.log(`[Send] Follow-up conversation started. API will be called at ${TIMING.API_CALL_TIME}s (1:16 minutes)`)
 
     return NextResponse.json({
       ok: true,

@@ -36,7 +36,7 @@ export default function SurikadoChat() {
   const softSkillsDelayRef = useRef<NodeJS.Timeout | null>(null)
 
   const POLL_INTERVAL = 3000 // Poll every 3 seconds
-  const SOFT_SKILLS_DELAY = 79000 // 79 seconds = 1.19 minutes
+  const SOFT_SKILLS_DELAY = 76000 // 76 seconds = 1:16 minutes
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -88,10 +88,6 @@ export default function SurikadoChat() {
       const msg = msgs[i]
       if (msg.type === "api" && isSoftSkillsQuestion(msg.content)) {
         return true // This is a follow-up to a previous soft skills response
-      }
-      if (msg.type === "user" && isSoftSkillsQuestion(msg.content)) {
-        // If we find a user soft skills message but no API response yet, don't delay
-        continue
       }
     }
     
@@ -257,7 +253,7 @@ export default function SurikadoChat() {
 
   // Handle soft skills delay and start polling
   const handleSoftSkillsFollowUp = () => {
-    console.log("[SoftSkills] Starting 79-second delay for follow-up response...")
+    console.log(`[SoftSkills] Starting ${SOFT_SKILLS_DELAY / 1000}-second delay for follow-up response...`)
     
     // Show initial waiting message
     setMessages((prev) => [
@@ -270,9 +266,9 @@ export default function SurikadoChat() {
       },
     ])
 
-    // Set timeout for 79 seconds before starting polling
+    // Set timeout for 76 seconds before starting polling
     softSkillsDelayRef.current = setTimeout(() => {
-      console.log("[SoftSkills] 79-second delay completed, starting polling...")
+      console.log(`[SoftSkills] ${SOFT_SKILLS_DELAY / 1000}-second delay completed, starting polling...`)
       startPolling()
     }, SOFT_SKILLS_DELAY)
   }
@@ -328,7 +324,7 @@ export default function SurikadoChat() {
       if (response.ok && result.isSoftSkillsResponse) {
         // Handle soft skills follow-up response with delay
         if (isFollowUpSoftSkills) {
-          console.log("[Send] Starting soft skills follow-up response flow with delay")
+          console.log("[Send] Starting soft skills follow-up response flow with 1:16 delay")
           handleSoftSkillsFollowUp()
         } else {
           // First soft skills response - show immediately
