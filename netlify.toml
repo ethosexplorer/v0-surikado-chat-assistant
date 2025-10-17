@@ -1,0 +1,13 @@
+[build]
+  command = "npm run build"
+  publish = "out"
+
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/:splat"
+  status = 200
+
+[functions]
+  # Increase timeout to 30 seconds (Netlify Pro plan required for > 10s)
+  timeout = 30
+  node_bundler = "esbuild"
