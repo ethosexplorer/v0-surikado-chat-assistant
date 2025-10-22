@@ -33,10 +33,9 @@ export default function SurikadoChat() {
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const softSkillsDelayRef = useRef<NodeJS.Timeout | null>(null)
+  const hasStartedPollingRef = useRef(false) // New ref to track polling state
 
   const POLL_INTERVAL = 3000 // Poll every 3 seconds
-  const SOFT_SKILLS_DELAY = 76000 // 76 seconds = 1:16 minutes
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -47,7 +46,6 @@ export default function SurikadoChat() {
   useEffect(() => {
     return () => {
       stopPolling()
-      stopSoftSkillsDelay()
     }
   }, [])
 
@@ -102,18 +100,16 @@ export default function SurikadoChat() {
     }
     setIsPolling(false)
     setIsLoading(false)
-  }
-
-  // Stop soft skills delay
-  const stopSoftSkillsDelay = () => {
-    if (softSkillsDelayRef.current) {
-      clearTimeout(softSkillsDelayRef.current)
-      softSkillsDelayRef.current = null
-    }
+    hasStartedPollingRef.current = false // Reset the flag
   }
 
   // Poll for response from server
   const pollForResponse = async () => {
+    // Prevent multiple simultaneous polling calls
+    if (!hasStartedPollingRef.current) {
+      return
+    }
+
     try {
       console.log("[Polling] Checking for response...")
       
@@ -129,16 +125,20 @@ export default function SurikadoChat() {
       if (!response.ok) {
         const result = await response.json()
         console.error("[Polling] Error:", result)
-        stopPolling()
-        setMessages((prev) => [
-          ...prev.filter((msg) => msg.type !== "typing"),
-          {
-            id: `${Date.now()}`,
-            type: "system",
-            content: result?.message || "Polling failed",
-            timestamp: new Date(),
-          },
-        ])
+        
+        // Don't stop polling immediately on errors - retry
+        setMessages((prev) => {
+          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
+          return [
+            ...withoutTyping,
+            {
+              id: `typing-${Date.now()}`,
+              type: "typing",
+              content: "🔄 Still processing...",
+              timestamp: new Date(),
+            },
+          ]
+        })
         return
       }
 
@@ -202,9 +202,18 @@ export default function SurikadoChat() {
           break
 
         case "none":
-          // No active conversation
-          console.log("[Polling] No active conversation")
+          // No active conversation - this might happen if cleanup occurred
+          console.log("[Polling] No active conversation - stopping polling")
           stopPolling()
+          setMessages((prev) => [
+            ...prev.filter((msg) => msg.type !== "typing"),
+            {
+              id: `${Date.now()}`,
+              type: "system",
+              content: "No active conversation found. Please send a new message.",
+              timestamp: new Date(),
+            },
+          ])
           break
 
         default:
@@ -212,24 +221,34 @@ export default function SurikadoChat() {
       }
     } catch (error) {
       console.error("[Polling] Exception:", error)
-      stopPolling()
-      setMessages((prev) => [
-        ...prev.filter((msg) => msg.type !== "typing"),
-        {
-          id: `${Date.now()}`,
-          type: "system",
-          content: "Error retrieving response. Please try again.",
-          timestamp: new Date(),
-        },
-      ])
+      // Don't stop polling on network errors - retry
+      setMessages((prev) => {
+        const withoutTyping = prev.filter((msg) => msg.type !== "typing")
+        return [
+          ...withoutTyping,
+          {
+            id: `typing-${Date.now()}`,
+            type: "typing",
+            content: "🔄 Still processing...",
+            timestamp: new Date(),
+          },
+        ]
+      })
     }
   }
 
   // Start polling process
   const startPolling = () => {
+    // Prevent starting multiple polling instances
+    if (hasStartedPollingRef.current) {
+      console.log("[Polling] Already running, skipping...")
+      return
+    }
+
     console.log("[Polling] Starting...")
     setIsPolling(true)
     setIsLoading(true)
+    hasStartedPollingRef.current = true
 
     // Add initial typing indicator
     setMessages((prev) => [
@@ -242,35 +261,13 @@ export default function SurikadoChat() {
       },
     ])
 
-    // Start polling immediately
+    // Start polling immediately - only call once
     pollForResponse()
 
     // Continue polling at intervals
     pollingIntervalRef.current = setInterval(() => {
       pollForResponse()
     }, POLL_INTERVAL)
-  }
-
-  // Handle soft skills delay and start polling
-  const handleSoftSkillsFollowUp = () => {
-    console.log(`[SoftSkills] Starting ${SOFT_SKILLS_DELAY / 1000}-second delay for follow-up response...`)
-    
-    // Show initial waiting message
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `typing-${Date.now()}`,
-        type: "typing",
-        content: "⏳ Processing your soft skills follow-up. This may take about 1-2 minutes...",
-        timestamp: new Date(),
-      },
-    ])
-
-    // Set timeout for 76 seconds before starting polling
-    softSkillsDelayRef.current = setTimeout(() => {
-      console.log(`[SoftSkills] ${SOFT_SKILLS_DELAY / 1000}-second delay completed, starting polling...`)
-      startPolling()
-    }, SOFT_SKILLS_DELAY)
   }
 
   // Send message to API
@@ -289,6 +286,11 @@ export default function SurikadoChat() {
       return
     }
 
+    // Stop any existing polling before starting new request
+    if (hasStartedPollingRef.current) {
+      stopPolling()
+    }
+
     // Add user message to UI
     const userMessage: Message = {
       id: Date.now().toString(),
@@ -302,7 +304,7 @@ export default function SurikadoChat() {
     setInputMessage("")
     setIsLoading(true)
 
-    // Check if this is a follow-up soft skills message that requires delay
+    // Check if this is a follow-up soft skills message that requires special handling
     const isFollowUpSoftSkills = shouldDelayForSoftSkills(messages, messageToSend)
     console.log("[Send] Is follow-up soft skills question:", isFollowUpSoftSkills)
 
@@ -314,44 +316,33 @@ export default function SurikadoChat() {
           action: "send",
           message: messageToSend,
           toPhone: normalizeWhatsApp(toPhone),
-          isSoftSkillsQuestion: isFollowUpSoftSkills, // Only delay for follow-ups
+          isSoftSkillsQuestion: isFollowUpSoftSkills,
         }),
       })
 
       const result = await response.json()
       console.log("[Send] API response:", result)
 
-      if (response.ok && result.isSoftSkillsResponse) {
-        // Handle soft skills follow-up response with delay
-        if (isFollowUpSoftSkills) {
-          console.log("[Send] Starting soft skills follow-up response flow with 1:16 delay")
-          handleSoftSkillsFollowUp()
+      if (response.ok) {
+        if (result.isSoftSkillsResponse || result.requiresPolling) {
+          // For responses that require polling, start the polling process
+          console.log("[Send] Starting polling for delayed response")
+          startPolling()
         } else {
-          // First soft skills response - show immediately
-          console.log("[Send] First soft skills response - showing immediately")
+          // Normal immediate response
           setIsLoading(false)
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: `${Date.now()}`,
-              type: "api",
-              content: result.message || "Message sent successfully",
-              timestamp: new Date(),
-            },
-          ])
+          if (result.message) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `${Date.now()}`,
+                type: "api",
+                content: result.message,
+                timestamp: new Date(),
+              },
+            ])
+          }
         }
-      } else if (response.ok) {
-        // Normal immediate response
-        setIsLoading(false)
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `${Date.now()}`,
-            type: "api",
-            content: result.message || "Message sent successfully",
-            timestamp: new Date(),
-          },
-        ])
       } else {
         // Error occurred
         setIsLoading(false)
@@ -498,7 +489,6 @@ export default function SurikadoChat() {
 
     // Clear local state
     stopPolling()
-    stopSoftSkillsDelay()
     setMessages([])
     setParsedResume(null)
     setShowParsedJSON(false)

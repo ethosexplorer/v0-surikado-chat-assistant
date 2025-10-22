@@ -1,7 +1,3 @@
-// ============================================
-// SERVER-SIDE: /app/api/send-message/route.ts
-// ============================================
-
 import { type NextRequest, NextResponse } from "next/server"
 
 // Configuration
@@ -104,12 +100,12 @@ class ConversationStore {
 
 const TIMING = {
   EMPTY_MESSAGE_INTERVAL: 8000, // 8 seconds between empty messages
-  API_CALL_TIME: 76, // Call webhook after 76 seconds (1:16 minutes) for follow-ups
-  MAX_TOTAL_TIME: 180, // 3 minutes absolute maximum
-  WEBHOOK_TIMEOUT: 120000, // 2 minutes for webhook call
+  API_CALL_TIME: 0, // Call webhook immediately for follow-ups
+  MAX_TOTAL_TIME: 300, // 5 minutes absolute maximum
+  WEBHOOK_TIMEOUT: 240000, // 4 minutes for webhook call
   NORMAL_MESSAGE_TIMEOUT: 25000, // 25 seconds for normal messages
   CLEANUP_INTERVAL: 60000, // Clean up every minute
-  MAX_CONVERSATION_AGE: 600000, // 10 minutes
+  MAX_CONVERSATION_AGE: 900000, // 15 minutes
 }
 
 // ============================================
@@ -436,9 +432,9 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
     }
   }
 
-  // Time to call API (at 76 seconds for follow-ups)
-  if (elapsedSeconds >= TIMING.API_CALL_TIME && !conversation.webhookCalled) {
-    console.log(`[Poll] ⏰ Reached ${TIMING.API_CALL_TIME}s - CALLING API NOW`)
+  // Call API immediately for soft skills follow-ups
+  if (!conversation.webhookCalled && conversation.isSoftSkillsFollowUp) {
+    console.log(`[Poll] ⏰ Starting API call for soft skills follow-up`)
     
     conversation.webhookCalled = true
     conversation.webhookStartTime = Date.now()
@@ -450,7 +446,7 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
 
     return NextResponse.json({
       status: "processing",
-      message: "⚡ Processing your information...",
+      message: "⚡ Processing your soft skills information...",
       elapsedSeconds,
       completed: false,
     })
@@ -473,7 +469,7 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
     })
   }
 
-  // Send empty messages before API call time
+  // Send empty messages while waiting
   const timeSinceLastEmpty = Date.now() - conversation.lastEmptyMessageTime
   if (timeSinceLastEmpty >= TIMING.EMPTY_MESSAGE_INTERVAL) {
     conversation.lastEmptyMessageTime = Date.now()
@@ -517,7 +513,7 @@ async function handleSendRequest(
       store.deleteResponse(userPhone)
     }
 
-    // Start tracking - API will be called at 76 seconds for follow-ups
+    // Start tracking - API will be called immediately during polling
     store.setConversation(userPhone, {
       startTime: Date.now(),
       lastEmptyMessageTime: Date.now(),
@@ -529,12 +525,12 @@ async function handleSendRequest(
       isSoftSkillsFollowUp: true,
     })
 
-    console.log(`[Send] Follow-up conversation started. API will be called at ${TIMING.API_CALL_TIME}s (1:16 minutes)`)
+    console.log(`[Send] Follow-up conversation started. API will be called immediately during polling`)
 
     return NextResponse.json({
       ok: true,
       status: "pending",
-      message: "Response received. Processing...",
+      message: "Processing your soft skills follow-up...",
       requestId,
       pending: true,
       isSoftSkillsResponse: true,

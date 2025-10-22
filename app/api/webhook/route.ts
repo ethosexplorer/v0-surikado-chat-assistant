@@ -127,7 +127,10 @@ async function sendToExternalAPI(userMessage: string, originalWebhookData: any) 
     }
   } catch (error) {
     console.error("[v0] Error calling external API:", error)
-    return { error: `Failed to call external API: ${error.message}` }
+    if (error instanceof Error) {
+      return { error: `Failed to call external API: ${error.message}` }
+    }
+    return { error: `Failed to call external API: ${String(error)}` }
   }
 }
 
