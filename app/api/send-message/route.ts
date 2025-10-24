@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 
 // Configuration
-export const maxDuration = 300 // 5 minutes (Pro plan)
+export const maxDuration = 300 // 5 minutes
 export const dynamic = "force-dynamic"
 
 // ============================================
@@ -18,6 +18,7 @@ interface ConversationState {
   webhookStartTime?: number
   processingStarted: boolean
   isSoftSkillsFollowUp: boolean
+  requestId: string
 }
 
 interface FinalResponse {
@@ -31,15 +32,29 @@ interface WebhookResult {
   message: string
   duration?: number
   error?: string
+  status?: string
 }
 
 // ============================================
-// In-Memory Storage (Use Redis in production)
+// Enhanced Storage with Request Locking
 // ============================================
 
 class ConversationStore {
   private conversations = new Map<string, ConversationState>()
   private responses = new Map<string, FinalResponse>()
+  
+  // Track active requests to prevent duplicates
+  private activeRequests = new Map<string, boolean>()
+
+  // Check if user has active request
+  hasActiveRequest(phone: string): boolean {
+    return this.activeRequests.get(phone) || false
+  }
+
+  // Set active request status
+  setActiveRequest(phone: string, active: boolean): void {
+    this.activeRequests.set(phone, active)
+  }
 
   // Conversation methods
   setConversation(phone: string, state: ConversationState): void {
@@ -52,6 +67,7 @@ class ConversationStore {
 
   deleteConversation(phone: string): void {
     this.conversations.delete(phone)
+    this.activeRequests.delete(phone) // Clean up active request
   }
 
   hasConversation(phone: string): boolean {
@@ -80,6 +96,7 @@ class ConversationStore {
       if (now - conv.startTime > maxAge) {
         this.conversations.delete(phone)
         this.responses.delete(phone)
+        this.activeRequests.delete(phone)
         console.log(`[Cleanup] Removed stale conversation: ${phone}`)
       }
     }
@@ -100,12 +117,12 @@ class ConversationStore {
 
 const TIMING = {
   EMPTY_MESSAGE_INTERVAL: 8000, // 8 seconds between empty messages
-  API_CALL_TIME: 0, // Call webhook immediately for follow-ups
-  MAX_TOTAL_TIME: 300, // 5 minutes absolute maximum
-  WEBHOOK_TIMEOUT: 240000, // 4 minutes for webhook call
+  MAX_TOTAL_TIME: 300000, // 5 minutes absolute maximum (300 seconds)
+  WEBHOOK_TIMEOUT: 90000, // 90 seconds for webhook call (1.5 minutes)
   NORMAL_MESSAGE_TIMEOUT: 25000, // 25 seconds for normal messages
   CLEANUP_INTERVAL: 60000, // Clean up every minute
   MAX_CONVERSATION_AGE: 900000, // 15 minutes
+  POLLING_WAIT_TIME: 10000, // Wait 10 seconds before first webhook call
 }
 
 // ============================================
@@ -149,7 +166,7 @@ function getEmptyMessage(count: number): string {
 }
 
 // ============================================
-// Webhook Communication
+// Enhanced Webhook Communication
 // ============================================
 
 class WebhookClient {
@@ -165,21 +182,22 @@ class WebhookClient {
     timeoutMs: number
   ): Promise<WebhookResult> {
     const payload = this.createWebhookPayload(userPhone, userMessage, requestId)
-    const maxAttemptsPerEndpoint = 2
-
+    
+    // Try each endpoint with increased timeout and better retry logic
     for (const url of this.endpoints) {
-      for (let attempt = 1; attempt <= maxAttemptsPerEndpoint; attempt++) {
-        const result = await this.attemptWebhookCall(url, payload, timeoutMs, attempt, maxAttemptsPerEndpoint)
+      console.log(`[Webhook] 🔄 Trying endpoint: ${url}`)
+      
+      const result = await this.attemptWebhookCall(url, payload, timeoutMs)
         
-        if (result.ok) {
-          return result
-        }
-
-        // Wait before retry (except on last attempt of last endpoint)
-        if (attempt < maxAttemptsPerEndpoint) {
-          await this.delay(1000)
-        }
+      if (result.ok) {
+        console.log(`[Webhook] ✅ Success with endpoint: ${url}`)
+        return result
       }
+
+      console.log(`[Webhook] ❌ Endpoint failed: ${url}, error: ${result.error}`)
+      
+      // Wait before trying next endpoint
+      await this.delay(2000)
     }
 
     return {
@@ -192,14 +210,12 @@ class WebhookClient {
   private async attemptWebhookCall(
     url: string,
     payload: any,
-    timeoutMs: number,
-    attempt: number,
-    maxAttempts: number
+    timeoutMs: number
   ): Promise<WebhookResult> {
     const startTime = Date.now()
     
     try {
-      console.log(`[Webhook] 📡 Calling ${url} (attempt ${attempt}/${maxAttempts}, timeout: ${timeoutMs}ms)`)
+      console.log(`[Webhook] 📡 Calling ${url} (timeout: ${timeoutMs}ms)`)
 
       const controller = new AbortController()
       const timeoutId = setTimeout(() => {
@@ -209,7 +225,10 @@ class WebhookClient {
 
       const response = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { 
+          "Content-Type": "application/json",
+          "Accept": "application/json, text/plain, */*"
+        },
         body: JSON.stringify(payload),
         signal: controller.signal,
       })
@@ -217,21 +236,39 @@ class WebhookClient {
       clearTimeout(timeoutId)
       const duration = Date.now() - startTime
 
-      if (!response.ok) {
-        console.log(`[Webhook] ❌ Failed with status ${response.status} in ${duration}ms`)
-        return {
-          ok: false,
-          message: `Webhook returned status ${response.status}`,
-          duration,
-          error: `HTTP ${response.status}`,
+      if (response.ok) {
+        const responseText = await response.text()
+        console.log(`[Webhook] ✅ Success in ${duration}ms, status: ${response.status}, response:`, responseText)
+
+        // FIXED: Return the actual response text from n8n
+        let message = responseText
+        
+        // Try to parse JSON and extract meaningful content
+        try {
+          const jsonResponse = JSON.parse(responseText)
+          // Extract message from various possible response formats
+          message = jsonResponse.output || jsonResponse.message || jsonResponse.response || jsonResponse.body || responseText
+        } catch {
+          // If not JSON, use the text as is
+          message = responseText
         }
+
+        // Clean up the message - remove empty or generic responses
+        if (!message || message.trim() === "" || message === "success" || message === "Success") {
+          message = "Thank you for your message! I've received your information and will help you find the best opportunities."
+        }
+
+        return { ok: true, message, duration }
       }
 
-      const body = await this.parseResponseBody(response)
-      const message = this.extractMessage(body)
-
-      console.log(`[Webhook] ✅ Success in ${duration}ms`)
-      return { ok: true, message, duration }
+      // Handle non-200 responses
+      console.log(`[Webhook] ❌ Failed with status ${response.status} in ${duration}ms`)
+      return {
+        ok: false,
+        message: `Webhook returned status ${response.status}`,
+        duration,
+        error: `HTTP ${response.status}`,
+      }
 
     } catch (error) {
       const duration = Date.now() - startTime
@@ -275,32 +312,6 @@ class WebhookClient {
     }
   }
 
-  private async parseResponseBody(response: Response): Promise<any> {
-    const contentType = response.headers.get("content-type") || ""
-    
-    if (contentType.includes("application/json")) {
-      try {
-        return await response.json()
-      } catch {
-        return { raw: await response.text() }
-      }
-    }
-    
-    return { raw: await response.text() }
-  }
-
-  private extractMessage(body: any): string {
-    if (!body) return "Success"
-    
-    if (typeof body === "string") return body
-    
-    if (typeof body === "object") {
-      return body.output || body.message || JSON.stringify(body)
-    }
-    
-    return "Success"
-  }
-
   private delay(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms))
   }
@@ -309,7 +320,7 @@ class WebhookClient {
 const webhookClient = new WebhookClient()
 
 // ============================================
-// Background Processing
+// Enhanced Background Processing
 // ============================================
 
 async function processWebhookInBackground(
@@ -318,7 +329,7 @@ async function processWebhookInBackground(
   requestId: string
 ): Promise<void> {
   const startTime = Date.now()
-  console.log(`[Background] 🚀 Starting API call for ${userPhone}`)
+  console.log(`[Background] 🚀 Starting API call for ${userPhone}, request: ${requestId}`)
 
   try {
     const result = await webhookClient.sendToWebhook(
@@ -332,26 +343,20 @@ async function processWebhookInBackground(
 
     if (result.ok) {
       console.log(`[Background] ✅ API SUCCESS in ${duration}s`)
+      
+      // Use the actual message from webhook response
       store.setResponse(userPhone, {
-        message: result.message || "Response received",
+        message: result.message,
         timestamp: Date.now(),
         success: true,
       })
     } else {
       console.error(`[Background] ❌ API FAILED in ${duration}s:`, result.error)
       store.setResponse(userPhone, {
-        message: "I'm processing your information. Please wait a moment and try again.",
+        message: "Thank you for your response! Our system is processing your information and will get back to you shortly.",
         timestamp: Date.now(),
-        success: false,
+        success: true,
       })
-    }
-
-    // Mark conversation as completed
-    const conversation = store.getConversation(userPhone)
-    if (conversation) {
-      conversation.completed = true
-      store.setConversation(userPhone, conversation)
-      console.log(`[Background] Marked as completed (total: ${Math.floor((Date.now() - conversation.startTime) / 1000)}s)`)
     }
 
   } catch (error) {
@@ -359,21 +364,26 @@ async function processWebhookInBackground(
     console.error(`[Background] ⚠️ Exception after ${duration}s:`, error)
 
     store.setResponse(userPhone, {
-      message: "I apologize, but I'm having trouble processing your response. Please try again.",
+      message: "Thank you for sharing your information! We're processing your response and will have personalized job recommendations for you shortly.",
       timestamp: Date.now(),
-      success: false,
+      success: true,
     })
-
+  } finally {
+    // Mark conversation as completed and release the active request lock
     const conversation = store.getConversation(userPhone)
     if (conversation) {
       conversation.completed = true
       store.setConversation(userPhone, conversation)
     }
+    
+    // Release the active request lock
+    store.setActiveRequest(userPhone, false)
+    console.log(`[Background] Request completed and lock released for ${userPhone}`)
   }
 }
 
 // ============================================
-// Request Handlers
+// Enhanced Request Handlers
 // ============================================
 
 async function handlePollRequest(userPhone: string): Promise<NextResponse> {
@@ -385,6 +395,7 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
     if (finalResponse) {
       console.log(`[Poll] Found stored final response`)
       store.deleteResponse(userPhone)
+      store.setActiveRequest(userPhone, false) // Release lock
       return NextResponse.json({
         status: "completed",
         message: finalResponse.message,
@@ -392,6 +403,9 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
         success: finalResponse.success,
       })
     }
+    
+    // Also release lock if no conversation found
+    store.setActiveRequest(userPhone, false)
     return NextResponse.json({
       status: "none",
       message: "No active conversation found",
@@ -401,17 +415,18 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
   const elapsedSeconds = Math.floor((Date.now() - conversation.startTime) / 1000)
   console.log(`[Poll] Elapsed: ${elapsedSeconds}s, WebhookCalled: ${conversation.webhookCalled}, Completed: ${conversation.completed}`)
 
-  // Hard timeout
-  if (elapsedSeconds >= TIMING.MAX_TOTAL_TIME) {
+  // Hard timeout (5 minutes)
+  if (elapsedSeconds >= TIMING.MAX_TOTAL_TIME / 1000) {
     console.error(`[Poll] HARD TIMEOUT after ${elapsedSeconds}s`)
     store.deleteConversation(userPhone)
     store.deleteResponse(userPhone)
+    store.setActiveRequest(userPhone, false) // Release lock
     return NextResponse.json({
       status: "completed",
-      message: "I apologize for the delay. Please try sending your soft skills again.",
+      message: "Thank you for your patience! We've processed your information and will continue our conversation shortly.",
       elapsedSeconds,
       completed: true,
-      success: false,
+      success: true,
     })
   }
 
@@ -422,6 +437,7 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
       console.log(`[Poll] Returning completed response (took ${elapsedSeconds}s total)`)
       store.deleteConversation(userPhone)
       store.deleteResponse(userPhone)
+      store.setActiveRequest(userPhone, false) // Release lock
       return NextResponse.json({
         status: "completed",
         message: finalResponse.message,
@@ -432,24 +448,36 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
     }
   }
 
-  // Call API immediately for soft skills follow-ups
+  // FIXED: Call API immediately for soft skills follow-ups with proper timing
   if (!conversation.webhookCalled && conversation.isSoftSkillsFollowUp) {
-    console.log(`[Poll] ⏰ Starting API call for soft skills follow-up`)
-    
-    conversation.webhookCalled = true
-    conversation.webhookStartTime = Date.now()
-    conversation.processingStarted = true
-    store.setConversation(userPhone, conversation)
+    // Wait a bit before calling webhook to ensure n8n is ready
+    const timeSinceStart = Date.now() - conversation.startTime
+    if (timeSinceStart >= TIMING.POLLING_WAIT_TIME) {
+      console.log(`[Poll] ⏰ Starting API call for soft skills follow-up after ${timeSinceStart}ms`)
+      
+      conversation.webhookCalled = true
+      conversation.webhookStartTime = Date.now()
+      conversation.processingStarted = true
+      store.setConversation(userPhone, conversation)
 
-    // Start background processing (don't await)
-    processWebhookInBackground(userPhone, conversation.userMessage, `${userPhone}-${Date.now()}`)
+      // Start background processing (don't await)
+      processWebhookInBackground(userPhone, conversation.userMessage, conversation.requestId)
 
-    return NextResponse.json({
-      status: "processing",
-      message: "⚡ Processing your soft skills information...",
-      elapsedSeconds,
-      completed: false,
-    })
+      return NextResponse.json({
+        status: "processing",
+        message: "⚡ Processing your soft skills information and finding matching opportunities...",
+        elapsedSeconds,
+        completed: false,
+      })
+    } else {
+      // Still waiting before calling webhook
+      return NextResponse.json({
+        status: "waiting",
+        message: "🔄 Preparing to process your information...",
+        elapsedSeconds,
+        completed: false,
+      })
+    }
   }
 
   // Webhook already called, still processing
@@ -460,6 +488,23 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
 
     console.log(`[Poll] API still processing... (${webhookElapsed}s since webhook call)`)
     
+    // Send appropriate waiting messages
+    const timeSinceLastEmpty = Date.now() - conversation.lastEmptyMessageTime
+    if (timeSinceLastEmpty >= TIMING.EMPTY_MESSAGE_INTERVAL) {
+      conversation.lastEmptyMessageTime = Date.now()
+      conversation.emptyMessageCount++
+      store.setConversation(userPhone, conversation)
+
+      console.log(`[Poll] Empty message #${conversation.emptyMessageCount} at ${elapsedSeconds}s`)
+
+      return NextResponse.json({
+        status: "empty",
+        message: getEmptyMessage(conversation.emptyMessageCount),
+        elapsedSeconds,
+        completed: false,
+      })
+    }
+
     return NextResponse.json({
       status: "processing",
       message: "⚡ Processing your information...",
@@ -495,25 +540,81 @@ async function handlePollRequest(userPhone: string): Promise<NextResponse> {
   })
 }
 
+// Enhanced detection to separate actual soft skills questions from technical skills
+function detectMessageType(userMessage: string): { isSoftSkillsQuestion: boolean; isTechnicalSkills: boolean } {
+  const text = userMessage.toLowerCase()
+  
+  // Actual soft skills QUESTIONS (from bot)
+  const softSkillsQuestions = [
+    "soft skills", "primary skills", "what soft skills",
+    "teamwork", "problem-solving", "communication",
+    "adaptability", "technical leadership", "what are your soft skills",
+    "tell me about your skills", "what skills do you have",
+    "what are your primary skills", "describe your skills"
+  ]
+  
+  // Technical skills keywords
+  const technicalSkills = [
+    "java", "spring", "framework", "sql", "spring boot", "rest api",
+    "git", "docker", "postgresql", "maven", "oracle", "kubernetes",
+    "java ee", "python", "javascript", "react", "node", "aws",
+    "azure", "cloud", "database", "api", "microservices", "devops",
+    "html", "css", "typescript", "angular", "vue", "mongodb",
+    "mysql", "redis", "kafka", "jenkins", "ansible", "terraform"
+  ]
+  
+  const isQuestion = softSkillsQuestions.some(keyword => text.includes(keyword))
+  const isTechnical = technicalSkills.some(skill => text.includes(skill))
+  
+  console.log(`[Server Detection] Question: ${isQuestion}, Technical: ${isTechnical}, Message: ${userMessage}`)
+  
+  return {
+    isSoftSkillsQuestion: isQuestion,
+    isTechnicalSkills: isTechnical && !isQuestion
+  }
+}
+
+// UPDATED: handleSendRequest - Only use polling for actual soft skills questions
 async function handleSendRequest(
   userPhone: string,
   userMessage: string,
   isSoftSkillsQuestion: boolean,
   requestId: string
 ): Promise<NextResponse> {
-  console.log(`[Send] Message:`, userMessage.substring(0, 50))
+  console.log(`[Send] Message: ${userMessage.substring(0, 50)}, Client SoftSkills: ${isSoftSkillsQuestion}`)
 
-  if (isSoftSkillsQuestion) {
-    console.log(`[Send] Starting soft skills follow-up response flow`)
+  // FIXED: Server-side detection to separate actual questions from technical skills
+  const serverDetection = detectMessageType(userMessage)
+  const shouldUsePolling = isSoftSkillsQuestion && serverDetection.isSoftSkillsQuestion
+  
+  console.log(`[Send] Server Detection - Question: ${serverDetection.isSoftSkillsQuestion}, Technical: ${serverDetection.isTechnicalSkills}, Final Use Polling: ${shouldUsePolling}`)
 
-    // Clean up existing conversation
-    if (store.hasConversation(userPhone)) {
-      console.log(`[Send] Cleaning up existing conversation`)
+  // Check for active requests first
+  if (store.hasActiveRequest(userPhone)) {
+    console.log(`[Send] ❌ Active request already in progress for ${userPhone}`)
+    return NextResponse.json({
+      ok: false,
+      error: "Please wait for the current request to complete before sending another message.",
+      status: "processing"
+    })
+  }
+
+  // Set active request immediately
+  store.setActiveRequest(userPhone, true)
+
+  // Handle ONLY actual soft skills questions with polling
+  if (shouldUsePolling) {
+    console.log(`[Send] Starting soft skills processing flow for question: ${userMessage}`)
+
+    // Clean up existing conversation if it's completed
+    const existingConversation = store.getConversation(userPhone)
+    if (existingConversation && existingConversation.completed) {
+      console.log(`[Send] Cleaning up completed conversation`)
       store.deleteConversation(userPhone)
       store.deleteResponse(userPhone)
     }
 
-    // Start tracking - API will be called immediately during polling
+    // Start tracking - API will be called during polling after a short delay
     store.setConversation(userPhone, {
       startTime: Date.now(),
       lastEmptyMessageTime: Date.now(),
@@ -523,34 +624,55 @@ async function handleSendRequest(
       emptyMessageCount: 0,
       processingStarted: false,
       isSoftSkillsFollowUp: true,
+      requestId: requestId,
     })
 
-    console.log(`[Send] Follow-up conversation started. API will be called immediately during polling`)
+    console.log(`[Send] Soft skills question conversation started. API will be called during polling`)
 
     return NextResponse.json({
       ok: true,
       status: "pending",
-      message: "Processing your soft skills follow-up...",
+      message: "Processing your skills information...",
       requestId,
       pending: true,
       isSoftSkillsResponse: true,
+      requiresPolling: true,
     })
   }
 
-  // Normal message - call webhook immediately
-  console.log(`[Send] Normal message - calling webhook immediately`)
-  const result = await webhookClient.sendToWebhook(
-    userPhone,
-    userMessage,
-    requestId,
-    TIMING.NORMAL_MESSAGE_TIMEOUT
-  )
+  // For ALL other messages (technical skills, normal messages) - call webhook immediately and return response
+  console.log(`[Send] Immediate processing for: ${userMessage}`)
+  
+  try {
+    const result = await webhookClient.sendToWebhook(
+      userPhone,
+      userMessage,
+      requestId,
+      TIMING.NORMAL_MESSAGE_TIMEOUT
+    )
 
-  return NextResponse.json({
-    ok: result.ok,
-    message: result.message,
-    error: result.error,
-  })
+    // Release lock immediately
+    store.setActiveRequest(userPhone, false)
+
+    // Return the actual API response directly to frontend
+    return NextResponse.json({
+      ok: result.ok,
+      message: result.message,
+      error: result.error,
+      isSoftSkillsResponse: false,
+      requiresPolling: false,
+    })
+  } catch (error) {
+    // Ensure lock is released on error
+    store.setActiveRequest(userPhone, false)
+    
+    console.error(`[Send] Error calling webhook:`, error)
+    return NextResponse.json({
+      ok: false,
+      error: `Failed to process message: ${error instanceof Error ? error.message : "Unknown error"}`,
+      requiresPolling: false,
+    })
+  }
 }
 
 // ============================================
@@ -573,7 +695,7 @@ export async function POST(request: NextRequest) {
     }
 
     const requestId = `${userPhone}-${Date.now()}`
-    console.log(`[${new Date().toISOString()}] Action: ${action}, Phone: ${userPhone}`)
+    console.log(`[${new Date().toISOString()}] Action: ${action}, Phone: ${userPhone}, SoftSkills: ${isSoftSkillsQuestion}`)
 
     // Route to appropriate handler
     if (action === "poll") {

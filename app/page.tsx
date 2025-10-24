@@ -14,7 +14,7 @@ interface Message {
 }
 
 interface PollResult {
-  status: "waiting" | "empty" | "processing" | "completed" | "none"
+  status: "waiting" | "processing" | "completed" | "none"
   message: string
   elapsedSeconds?: number
   completed: boolean
@@ -33,9 +33,13 @@ export default function SurikadoChat() {
 
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
-  const hasStartedPollingRef = useRef(false) // New ref to track polling state
+  
+  // Request tracking
+  const currentRequestIdRef = useRef<string>("")
+  const isSendingRef = useRef(false)
+  const isWaitingForResponseRef = useRef(false)
 
-  const POLL_INTERVAL = 3000 // Poll every 3 seconds
+  const POLL_INTERVAL = 3000
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -59,37 +63,64 @@ export default function SurikadoChat() {
     return `whatsapp:${n}`
   }
 
-  // Check if message is about soft skills
-  const isSoftSkillsQuestion = (message: string): boolean => {
+  // Enhanced soft skills detection
+  const isSoftSkillsMessage = (message: string): boolean => {
     const text = message.toLowerCase()
-    return (
-      /soft\s*skills?/.test(text) ||
-      /your\s+soft\s+skills?/.test(text) ||
-      /list.*soft\s*skills?/.test(text) ||
-      /what\s+soft\s+skills\s+do\s+you\s+excel\s+at/.test(text) ||
-      (/teamwork/.test(text) && /problem-?solving/.test(text)) ||
-      /communication/.test(text) ||
-      /leadership/.test(text) ||
-      /collaboration/.test(text)
+    
+    // Soft skills QUESTIONS (from bot)
+    const softSkillsQuestions = [
+      "soft skills", "primary skills", "what soft skills",
+      "teamwork", "problem-solving", "communication",
+      "adaptability", "technical leadership", "what are your soft skills",
+      "tell me about your skills", "what skills do you have",
+      "what are your primary skills", "describe your skills"
+    ]
+    
+    // Soft skills RESPONSES (from user) - expanded to include technical skills
+    const softSkillsResponses = [
+      "problem-solving", "adaptability", "technical leadership",
+      "teamwork", "communication", "collaboration", "leadership",
+      "critical thinking", "time management", "creativity",
+      "java", "spring", "framework", "sql", "spring boot", "rest api",
+      "git", "docker", "postgresql", "maven", "oracle", "kubernetes",
+      "java ee", "python", "javascript", "react", "node", "aws",
+      "azure", "cloud", "database", "api", "microservices", "devops",
+      "agile", "scrum", "ci/cd", "testing", "debugging"
+    ]
+    
+    const isQuestion = softSkillsQuestions.some(keyword => text.includes(keyword))
+    const isResponse = softSkillsResponses.some(keyword => text.includes(keyword))
+    
+    console.log("[Detection] Soft skills - Question:", isQuestion, "Response:", isResponse, "Message:", message)
+    
+    // Detect if this looks like a skills list (multiple technical terms)
+    const technicalTerms = text.split(/\s+/).filter(word => 
+      softSkillsResponses.some(skill => word.includes(skill))
     )
+    const isSkillsList = technicalTerms.length >= 2
+    
+    console.log("[Detection] Technical terms found:", technicalTerms, "Is skills list:", isSkillsList)
+    
+    return isQuestion || isResponse || isSkillsList
   }
 
-  // Check if we should apply delay for follow-up soft skills messages
-  const shouldDelayForSoftSkills = (msgs: Message[], currentMessage: string): boolean => {
-    // Check if current message is about soft skills
-    if (!isSoftSkillsQuestion(currentMessage)) {
-      return false
-    }
-
-    // Check if there was a previous soft skills response in the conversation
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const msg = msgs[i]
-      if (msg.type === "api" && isSoftSkillsQuestion(msg.content)) {
-        return true // This is a follow-up to a previous soft skills response
+  // Request validation
+  const canMakeNewRequest = (): { canMake: boolean; message?: string } => {
+    if (isSendingRef.current) {
+      return { 
+        canMake: false, 
+        message: "Please wait, your previous message is being processed..." 
       }
     }
     
-    return false
+    if (isWaitingForResponseRef.current) {
+      return { 
+        canMake: false, 
+        message: "Please wait for the current response to complete before sending another message." 
+      }
+    }
+    
+    return { canMake: true }
   }
 
   // Stop polling
@@ -100,13 +131,17 @@ export default function SurikadoChat() {
     }
     setIsPolling(false)
     setIsLoading(false)
-    hasStartedPollingRef.current = false // Reset the flag
+    isWaitingForResponseRef.current = false
+    isSendingRef.current = false
+    currentRequestIdRef.current = ""
+    console.log("[Polling] Stopped polling")
   }
 
-  // Poll for response from server
+  // Polling for response
   const pollForResponse = async () => {
-    // Prevent multiple simultaneous polling calls
-    if (!hasStartedPollingRef.current) {
+    if (!isWaitingForResponseRef.current) {
+      console.log("[Polling] No active request, stopping polling")
+      stopPolling()
       return
     }
 
@@ -119,6 +154,7 @@ export default function SurikadoChat() {
         body: JSON.stringify({
           action: "poll",
           toPhone: normalizeWhatsApp(toPhone),
+          requestId: currentRequestIdRef.current,
         }),
       })
 
@@ -126,47 +162,27 @@ export default function SurikadoChat() {
         const result = await response.json()
         console.error("[Polling] Error:", result)
         
-        // Don't stop polling immediately on errors - retry
-        setMessages((prev) => {
-          const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-          return [
-            ...withoutTyping,
+        // Stop polling on server errors
+        if (response.status >= 400) {
+          stopPolling()
+          setMessages((prev) => [
+            ...prev.filter((msg) => msg.type !== "typing"),
             {
-              id: `typing-${Date.now()}`,
-              type: "typing",
-              content: "🔄 Still processing...",
+              id: `${Date.now()}`,
+              type: "system",
+              content: "Server error. Please try again.",
               timestamp: new Date(),
             },
-          ]
-        })
+          ])
+        }
         return
       }
 
       const result: PollResult = await response.json()
       console.log("[Polling] Result:", result)
 
-      // Handle different polling states
       switch (result.status) {
-        case "empty":
-          // Update typing indicator with new message
-          console.log("[Polling] Empty message:", result.message)
-          setMessages((prev) => {
-            const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-            return [
-              ...withoutTyping,
-              {
-                id: `typing-${Date.now()}`,
-                type: "typing",
-                content: result.message,
-                timestamp: new Date(),
-              },
-            ]
-          })
-          break
-
         case "processing":
-          // Show processing status
-          console.log("[Polling] Processing webhook...")
           setMessages((prev) => {
             const withoutTyping = prev.filter((msg) => msg.type !== "typing")
             return [
@@ -182,8 +198,7 @@ export default function SurikadoChat() {
           break
 
         case "completed":
-          // Final response received - stop polling
-          console.log("[Polling] Completed! Message:", result.message)
+          console.log("[Polling] ✅ Completed! Message:", result.message)
           stopPolling()
           setMessages((prev) => [
             ...prev.filter((msg) => msg.type !== "typing"),
@@ -196,13 +211,7 @@ export default function SurikadoChat() {
           ])
           break
 
-        case "waiting":
-          // Still waiting - keep polling
-          console.log("[Polling] Waiting... Elapsed:", result.elapsedSeconds)
-          break
-
         case "none":
-          // No active conversation - this might happen if cleanup occurred
           console.log("[Polling] No active conversation - stopping polling")
           stopPolling()
           setMessages((prev) => [
@@ -221,36 +230,34 @@ export default function SurikadoChat() {
       }
     } catch (error) {
       console.error("[Polling] Exception:", error)
-      // Don't stop polling on network errors - retry
-      setMessages((prev) => {
-        const withoutTyping = prev.filter((msg) => msg.type !== "typing")
-        return [
-          ...withoutTyping,
-          {
-            id: `typing-${Date.now()}`,
-            type: "typing",
-            content: "🔄 Still processing...",
-            timestamp: new Date(),
-          },
-        ]
-      })
+      // Stop polling on network errors
+      stopPolling()
+      setMessages((prev) => [
+        ...prev.filter((msg) => msg.type !== "typing"),
+        {
+          id: `${Date.now()}`,
+          type: "system",
+          content: "Network error during polling. Please try again.",
+          timestamp: new Date(),
+        },
+      ])
     }
   }
 
-  // Start polling process
-  const startPolling = () => {
-    // Prevent starting multiple polling instances
-    if (hasStartedPollingRef.current) {
-      console.log("[Polling] Already running, skipping...")
-      return
+  // Start polling
+  const startPolling = (requestId: string) => {
+    // Always stop any existing polling first
+    if (isWaitingForResponseRef.current) {
+      console.log("[Polling] Stopping previous polling session")
+      stopPolling()
     }
 
-    console.log("[Polling] Starting...")
+    console.log("[Polling] Starting polling for request:", requestId)
+    currentRequestIdRef.current = requestId
     setIsPolling(true)
     setIsLoading(true)
-    hasStartedPollingRef.current = true
+    isWaitingForResponseRef.current = true
 
-    // Add initial typing indicator
     setMessages((prev) => [
       ...prev,
       {
@@ -261,18 +268,16 @@ export default function SurikadoChat() {
       },
     ])
 
-    // Start polling immediately - only call once
+    // Start polling immediately and then set interval
     pollForResponse()
-
-    // Continue polling at intervals
-    pollingIntervalRef.current = setInterval(() => {
-      pollForResponse()
-    }, POLL_INTERVAL)
+    pollingIntervalRef.current = setInterval(pollForResponse, POLL_INTERVAL)
   }
 
-  // Send message to API
+  // Send message with immediate processing for soft skills
   const handleSendMessage = async () => {
-    if (!inputMessage.trim()) return
+    const messageToSend = inputMessage.trim()
+    if (!messageToSend) return
+    
     if (!toPhone.trim()) {
       setMessages((prev) => [
         ...prev,
@@ -286,29 +291,45 @@ export default function SurikadoChat() {
       return
     }
 
-    // Stop any existing polling before starting new request
-    if (hasStartedPollingRef.current) {
-      stopPolling()
+    // Enhanced validation
+    const canRequest = canMakeNewRequest()
+    if (!canRequest.canMake) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}`,
+          type: "system",
+          content: canRequest.message!,
+          timestamp: new Date(),
+        },
+      ])
+      return
     }
+
+    // Set flags BEFORE making request
+    isSendingRef.current = true
 
     // Add user message to UI
     const userMessage: Message = {
       id: Date.now().toString(),
       type: "user",
-      content: inputMessage,
+      content: messageToSend,
       timestamp: new Date(),
     }
     setMessages((prev) => [...prev, userMessage])
 
-    const messageToSend = inputMessage
     setInputMessage("")
     setIsLoading(true)
 
-    // Check if this is a follow-up soft skills message that requires special handling
-    const isFollowUpSoftSkills = shouldDelayForSoftSkills(messages, messageToSend)
-    console.log("[Send] Is follow-up soft skills question:", isFollowUpSoftSkills)
+    // Use enhanced detection for ALL soft skills messages
+    const isSoftSkills = isSoftSkillsMessage(messageToSend)
+    console.log("[Send] Is soft skills message:", isSoftSkills, "Message:", messageToSend)
 
     try {
+      const requestId = `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+      
+      console.log("[Send] Making API request to:", "/api/send-message")
+      
       const response = await fetch("/api/send-message", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -316,21 +337,28 @@ export default function SurikadoChat() {
           action: "send",
           message: messageToSend,
           toPhone: normalizeWhatsApp(toPhone),
-          isSoftSkillsQuestion: isFollowUpSoftSkills,
+          isSoftSkillsQuestion: isSoftSkills,
+          requestId: requestId,
         }),
       })
+
+      // Check if response is ok
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
 
       const result = await response.json()
       console.log("[Send] API response:", result)
 
       if (response.ok) {
-        if (result.isSoftSkillsResponse || result.requiresPolling) {
-          // For responses that require polling, start the polling process
-          console.log("[Send] Starting polling for delayed response")
-          startPolling()
+        if (result.isSoftSkillsResponse) {
+          // For soft skills responses, start polling immediately
+          console.log("[Send] Starting polling for soft skills response")
+          startPolling(requestId)
         } else {
           // Normal immediate response
           setIsLoading(false)
+          isSendingRef.current = false
           if (result.message) {
             setMessages((prev) => [
               ...prev,
@@ -344,27 +372,40 @@ export default function SurikadoChat() {
           }
         }
       } else {
-        // Error occurred
+        // Error occurred in API response
+        console.error("[Send] API error:", result.error)
         setIsLoading(false)
+        isSendingRef.current = false
         setMessages((prev) => [
           ...prev,
           {
             id: `${Date.now()}`,
             type: "system",
-            content: result.error || "Failed to send message",
+            content: result.error || "Failed to send message. Please try again.",
             timestamp: new Date(),
           },
         ])
       }
     } catch (error) {
-      console.error("[Send] Error:", error)
+      console.error("[Send] Network error:", error)
       setIsLoading(false)
+      isSendingRef.current = false
+      
+      // Enhanced error message based on error type
+      let errorMessage = "Network error. Please check your connection and try again."
+      
+      if (error instanceof TypeError && error.message.includes("Failed to fetch")) {
+        errorMessage = "Unable to connect to the server. Please check if your development server is running on localhost:3000."
+      } else if (error instanceof Error) {
+        errorMessage = `Error: ${error.message}`
+      }
+      
       setMessages((prev) => [
         ...prev,
         {
           id: Date.now().toString(),
           type: "system",
-          content: "Network error. Please check your connection and try again.",
+          content: errorMessage,
           timestamp: new Date(),
         },
       ])
@@ -444,7 +485,6 @@ export default function SurikadoChat() {
       const sessionId = toPhone.trim() ? normalizeWhatsApp(toPhone) : ""
       
       if (sessionId) {
-        // Call backend to clear chat history
         const response = await fetch(
           "https://surikado.hellodexter.com/webhook/delete-chat-history",
           {
@@ -479,8 +519,6 @@ export default function SurikadoChat() {
 
         if (!response.ok) {
           console.error("[Clear] Failed to delete chat history from server")
-        } else {
-          console.log("[Clear] Chat history cleared from server")
         }
       }
     } catch (error) {
@@ -493,6 +531,16 @@ export default function SurikadoChat() {
     setParsedResume(null)
     setShowParsedJSON(false)
     console.log("[Clear] Local cache cleared")
+  }
+
+  // Handle Enter key properly
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      if (!isLoading && !isSendingRef.current && !isWaitingForResponseRef.current) {
+        handleSendMessage()
+      }
+    }
   }
 
   return (
@@ -518,7 +566,7 @@ export default function SurikadoChat() {
               variant="secondary"
               size="sm"
               onClick={handleParseJSON}
-              disabled={isParsing || messages.length === 0}
+              disabled={isParsing || messages.length === 0 || isSendingRef.current || isWaitingForResponseRef.current}
               className="bg-white/10 hover:bg-white/20 text-white border-white/20"
             >
               <FileText className="w-4 h-4 mr-1" />
@@ -528,6 +576,7 @@ export default function SurikadoChat() {
               variant="secondary"
               size="sm"
               onClick={handleClearCache}
+              disabled={isSendingRef.current || isWaitingForResponseRef.current}
               className="bg-white/10 hover:bg-white/20 text-white border-white/20"
             >
               <Trash2 className="w-4 h-4 mr-1" />
@@ -603,37 +652,20 @@ export default function SurikadoChat() {
             )}
           </div>
 
-          {/* Parsed JSON Display */}
-          {showParsedJSON && parsedResume && (
-            <div className="mb-4 p-4 bg-gray-50 rounded-lg border border-gray-200 max-h-40 overflow-y-auto">
-              <div className="flex justify-between items-center mb-2">
-                <h3 className="font-semibold text-sm">Parsed Resume JSON</h3>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => setShowParsedJSON(false)}
-                  className="h-6 px-2"
-                >
-                  ✕
-                </Button>
-              </div>
-              <pre className="text-xs overflow-x-auto">
-                {JSON.stringify(parsedResume, null, 2)}
-              </pre>
-            </div>
-          )}
-
           {/* Input Area */}
           <div className="flex gap-2">
             <Input
               value={inputMessage}
               onChange={(e) => setInputMessage(e.target.value)}
               placeholder="Type your message..."
-              onKeyPress={(e) => e.key === "Enter" && !isLoading && handleSendMessage()}
+              onKeyPress={handleKeyPress}
               className="flex-1"
-              disabled={isLoading}
+              disabled={isLoading || isSendingRef.current || isWaitingForResponseRef.current}
             />
-            <Button onClick={handleSendMessage} disabled={isLoading || !inputMessage.trim()}>
+            <Button 
+              onClick={handleSendMessage} 
+              disabled={isLoading || !inputMessage.trim() || isSendingRef.current || isWaitingForResponseRef.current}
+            >
               <Send className="w-4 h-4" />
             </Button>
           </div>
