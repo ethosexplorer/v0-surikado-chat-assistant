@@ -6,7 +6,6 @@ import { type NextRequest, NextResponse } from "next/server"
 
 class WebhookClient {
   private readonly endpoints = [
-    "https://surikado.hellodexter.com:5678/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
     "https://surikado.hellodexter.com/webhook/130bb4fe-11e5-4442-9a63-a68de302e144",
   ]
 
